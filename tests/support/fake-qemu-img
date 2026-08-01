@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+cmd="$1"; shift
+case "$cmd" in
+  create)
+    backing=
+    while (($# > 1)); do
+      [[ "$1" == -b ]] && { backing="$2"; shift 2; continue; }
+      shift
+    done
+    out="$1"; printf 'backing=%s\n' "$backing" >"$out"
+    ;;
+  info)
+    file="${@: -1}"; backing="$(sed -n 's/^backing=//p' "$file")"
+    if [[ -n "$backing" ]]; then printf '{"format":"qcow2","backing-filename":"%s"}\n' "$backing"; else echo '{"format":"qcow2"}'; fi
+    ;;
+  check)
+    [[ ! -e "$TEST_ROOT/fail-check" ]]
+    [[ ! -e "$TEST_ROOT/fail-candidate-check" || "${@: -1}" != *promotion-candidate.qcow2 ]]
+    ;;
+  convert)
+    [[ ! -e "$TEST_ROOT/fail-convert" ]] || exit 1
+    in="${@: -2:1}"; out="${@: -1}"; printf 'standalone-from=%s\n' "$(sha256sum "$in" | awk '{print $1}')" >"$out"
+    ;;
+  *) exit 2 ;;
+esac

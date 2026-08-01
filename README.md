@@ -1,43 +1,50 @@
 # bitcoin-vm-lab
 
-Persistent Ubuntu, UmbrelOS, and StartOS KVM/libvirt machines sharing one
-**sequentially attached** Bitcoin mainnet data set. Each run receives a
-disposable qcow2 overlay backed by a protected canonical checkpoint.
+`bitcoin-vm-lab` runs persistent Ubuntu, UmbrelOS, and StartOS guests
+sequentially under Gentoo's system libvirt. The guests share one protected
+Bitcoin mainnet checkpoint through exactly one disposable qcow2 overlay.
 
-The entry point is `./bin/bvml`; begin with:
+Generated storage defaults to `/var/lib/libvirt/images/bitcoin-vm-lab`, outside
+the repository and the user's home directory:
+
+```text
+canonical/bitcoin-mainnet.qcow2          protected checkpoint
+canonical/bitcoin-mainnet.rollback.qcow2 previous checkpoint, when available
+active/bitcoin-mainnet-overlay.qcow2     the only disposable overlay
+active/manifest.env                      retained overlay/checkpoint identity
+run/owner.env                            live attachment owner
+vms/{ubuntu,umbrel,startos}/             persistent system/application disks
+```
+
+The canonical image is never attached. `start` creates the single overlay,
+attaches it to one exactly-shut-off domain, records ownership, and boots.
+`stop` waits for exact `shut off`, detaches it, and retains it. No other guest
+can start until the overlay is discarded or promoted.
+
+Start here:
 
 ```bash
-./bin/bvml host-setup
+cp config/local.env.example config/local.env
+sudo ./bin/bvml host-setup
+./bin/bvml host-validate
 ./bin/bvml init
 ./bin/bvml create ubuntu
+./bin/bvml checkpoint-import
 ./bin/bvml start ubuntu
 ```
 
-Read [docs/OPERATIONS.md](docs/OPERATIONS.md) before creating or updating the
-checkpoint. It describes guest-side synchronization and verification steps.
+The normal initial import reads the existing clean datadir at
+`~/projects/bitcoin-knots-dev/bitcoin`; it does not perform IBD. It streams only
+blocks, chainstate, indexes, and block-format metadata into an image sized from
+actual data plus configured headroom. A live source lock or non-zero
+`blocks/xor.dat` aborts the import.
 
-## Storage model
+Ubuntu uses pinned Bitcoin Knots with explicit, release-validated RDTS
+arguments. UmbrelOS and StartOS use isolated release profiles that bind the
+complete overlay datadir and pinned Knots binary into the packaged application.
+An adapter is not considered configured until its exact package paths/version
+are declared and its in-guest `verify` operation passes.
 
-```
-storage/
-  canonical/bitcoin-mainnet.qcow2       immutable, read-only checkpoint
-  overlays/<vm>/bitcoin-mainnet.qcow2   disposable active overlay
-  vms/<vm>/system.qcow2                 persistent guest OS
-  vms/<vm>/application.qcow2            persistent application data
-  run/bitcoin-data.owner                active attachment record
-```
-
-The canonical disk is never attached to a VM. `start` first takes an exclusive
-lock and creates a new overlay. `stop` releases the owner record only after
-libvirt confirms the domain is inactive.
-
-## Commands
-
-`./bin/bvml help` lists commands. Important commands are `create`, `start`,
-`stop`, `discard`, `reset`, `checkpoint-update`, `validate`, and `status`.
-
-## Scope and assumptions
-
-The scripts target an amd64 Gentoo host and libvirt's `qemu:///system`
-connection. Guest installation ISOs are supplied locally and selected and
-checksummed by the operator. See `config/local.env.example`.
+See [docs/OPERATIONS.md](docs/OPERATIONS.md) for the full import, guest setup,
+testing, promotion, rollback, recovery, and backup procedures. Run
+`./bin/bvml help` for the command list and `./bin/bvml test` for lifecycle tests.

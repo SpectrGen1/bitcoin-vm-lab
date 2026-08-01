@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "${1:-}" == -c ]] && shift 2
+cmd="${1:-}"; shift || true
+vm_from_domain() { printf '%s' "${1#bvml-}"; }
+case "$cmd" in
+  version) echo 'mock libvirt 1' ;;
+  dominfo) echo 'Id: -' ;;
+  domstate) vm="$(vm_from_domain "$1")"; cat "$TEST_ROOT/state-$vm" ;;
+  domblklist)
+    vm="$(vm_from_domain "$1")"
+    printf 'Type Device Target Source\n--------------------------------\n'
+    [[ -f "$TEST_ROOT/attach-$vm" ]] && awk '{print "file disk "$1" "$2}' "$TEST_ROOT/attach-$vm"
+    ;;
+  attach-disk)
+    vm="$(vm_from_domain "$1")"; source="$2"; target="$3"
+    [[ ! -e "$TEST_ROOT/fail-attach" ]] || exit 1
+    printf '%s %s\n' "$target" "$source" >"$TEST_ROOT/attach-$vm"
+    ;;
+  detach-disk) vm="$(vm_from_domain "$1")"; rm -f -- "$TEST_ROOT/attach-$vm" ;;
+  start)
+    vm="$(vm_from_domain "$1")"; [[ ! -e "$TEST_ROOT/fail-start" ]] || exit 1
+    echo running >"$TEST_ROOT/state-$vm"
+    ;;
+  shutdown)
+    vm="$(vm_from_domain "$1")"
+    [[ -e "$TEST_ROOT/stuck-shutdown" ]] || echo 'shut off' >"$TEST_ROOT/state-$vm"
+    ;;
+  list) : ;;
+  *) echo "unsupported fake virsh command: $cmd" >&2; exit 2 ;;
+esac

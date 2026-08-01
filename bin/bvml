@@ -4,22 +4,32 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cmd="${1:-help}"; shift || true
 case "$cmd" in
   host-setup) exec "$ROOT/scripts/host/setup-gentoo.sh" "$@" ;;
-  init|create|start|stop|discard|reset|checkpoint-create|checkpoint-update|checkpoint-protect|validate|status) exec "$ROOT/scripts/vm/manage.sh" "$cmd" "$@" ;;
-  help|-h|--help) cat <<'EOF'
-Usage: bin/bvml COMMAND [VM]
-  host-setup                 install/configure Gentoo KVM/libvirt prerequisites
-  init                       create protected storage layout
-  create VM                  create persistent VM disks and libvirt definition
-  start VM                   create fresh Bitcoin overlay and boot VM
-  stop VM                    cleanly shut down VM and release data ownership
-  discard VM                 remove inactive VM's current Bitcoin overlay
-  reset VM                   stop if needed, then discard its overlay
-  checkpoint-create          initialize empty protected canonical Bitcoin disk
-  checkpoint-update          promote a clean, synced Ubuntu overlay to canonical
-  checkpoint-protect         enforce canonical read-only protection
-  validate                   check host tools, images, XML, and ownership state
-  status                     show domains and Bitcoin-data ownership
+  host-validate) exec "$ROOT/scripts/host/validate-gentoo.sh" "$@" ;;
+  init|create|start|stop|discard|reset|checkpoint-import|checkpoint-verify|checkpoint-promote|checkpoint-protect|checkpoint-rollback|adapter-status|validate|status)
+    exec "$ROOT/scripts/vm/manage.sh" "$cmd" "$@" ;;
+  test) exec "$ROOT/tests/run.sh" "$@" ;;
+  help|-h|--help)
+    sed -n '/^Commands:/,$p' <<'EOF'
+Commands:
+  host-validate                  verify KVM, libvirt, UEFI, and storage access
+  host-setup                     install/configure minimal Gentoo prerequisites
+  init                           initialize system-libvirt storage
+  create VM                      create a persistent VM from a verified ISO
+  checkpoint-import [options]    import a clean existing Bitcoin datadir
+  start VM                       create, attach, and boot one fresh overlay
+  stop VM                        cleanly stop, detach, and retain the overlay
+  discard [VM]                   discard the inactive overlay
+  reset VM                       stop if necessary, then discard the overlay
+  checkpoint-verify              extract stopped Ubuntu Knots verification
+  checkpoint-promote --confirm-synced-clean
+                                 promote a verified Ubuntu Knots/RDTS overlay
+  checkpoint-protect             restore canonical protection
+  checkpoint-rollback            atomically restore the rollback checkpoint
+  adapter-status [VM]            inspect supported guest adapter configuration
+  validate                       run full state and host validation
+  status                         concise checkpoint/overlay/domain safety report
+  test                           run mocked lifecycle tests
 EOF
     ;;
-  *) echo "unknown command: $cmd" >&2; exit 64 ;;
+  *) echo "unknown command: $cmd (try: bin/bvml help)" >&2; exit 64 ;;
 esac
