@@ -1,0 +1,8 @@
+config/local.env
+storage/
+state/*.lock
+state/*.owner
+*.iso
+*.img
+*.qcow2
+cloud-init-*.iso

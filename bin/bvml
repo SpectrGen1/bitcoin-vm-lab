@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  host-setup) exec "$ROOT/scripts/host/setup-gentoo.sh" "$@" ;;
+  init|create|start|stop|discard|reset|checkpoint-create|checkpoint-update|checkpoint-protect|validate|status) exec "$ROOT/scripts/vm/manage.sh" "$cmd" "$@" ;;
+  help|-h|--help) cat <<'EOF'
+Usage: bin/bvml COMMAND [VM]
+  host-setup                 install/configure Gentoo KVM/libvirt prerequisites
+  init                       create protected storage layout
+  create VM                  create persistent VM disks and libvirt definition
+  start VM                   create fresh Bitcoin overlay and boot VM
+  stop VM                    cleanly shut down VM and release data ownership
+  discard VM                 remove inactive VM's current Bitcoin overlay
+  reset VM                   stop if needed, then discard its overlay
+  checkpoint-create          initialize empty protected canonical Bitcoin disk
+  checkpoint-update          promote a clean, synced Ubuntu overlay to canonical
+  checkpoint-protect         enforce canonical read-only protection
+  validate                   check host tools, images, XML, and ownership state
+  status                     show domains and Bitcoin-data ownership
+EOF
+    ;;
+  *) echo "unknown command: $cmd" >&2; exit 64 ;;
+esac
