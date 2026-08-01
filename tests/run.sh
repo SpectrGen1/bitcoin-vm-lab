@@ -34,7 +34,7 @@ setup_case() {
   printf '#!/bin/sh\n[[ ! -e "$TEST_ROOT/fail-virt-customize" ]]\n' >"$TEST_ROOT/bin/virt-customize"
   printf '#!/bin/sh\ncase "$*" in *ubuntu-verification.env*) [[ -f "$TEST_ROOT/guest-evidence" ]] && cat "$TEST_ROOT/guest-evidence" || exit 1;; *) exit 0;; esac\n' >"$TEST_ROOT/bin/virt-cat"
   printf '#!/bin/sh\nprintf "Name UUID\\n/dev/sda fs1\\n"\n' >"$TEST_ROOT/bin/virt-filesystems"
-  printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nsize=; out="${@: -1}"\nwhile (($#)); do case "$1" in --size) size="$2"; shift 2;; --size=*) size="${1#--size=}"; shift;; *) shift;; esac; done\n[[ "$size" =~ ^[0-9]+$ ]] || exit 9\nprintf "backing=\\nimport_size=%s\\n" "$size" >"$out"\n' >"$TEST_ROOT/bin/virt-make-fs"
+  printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nsize=; out="${@: -1}"\nwhile (($#)); do case "$1" in --size) size="$2"; shift 2;; --size=*) size="${1#--size=}"; shift;; *) shift;; esac; done\n[[ "$size" =~ ^[0-9]+$ ]] || exit 9\ndd of=/dev/null status=none\nprintf "backing=\\nimport_size=%s\\n" "$size" >"$out"\n' >"$TEST_ROOT/bin/virt-make-fs"
   chmod +x "$TEST_ROOT/bin"/*
   printf release >"$TEST_ROOT/release.env"; printf rdts >"$TEST_ROOT/rdts.env"
 }

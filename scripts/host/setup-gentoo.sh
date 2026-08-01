@@ -11,7 +11,10 @@ trap 'rm -f -- "$tmp"' EXIT
 printf '%s\n' \
   '# bitcoin-vm-lab: system QEMU, daemon, NAT network, and libguestfs' \
   'app-emulation/libvirt libvirtd qemu virt-network' \
-  'app-emulation/qemu spice vnc' >"$tmp"
+  'app-emulation/qemu spice vnc' \
+  'media-libs/netpbm png' \
+  'net-dns/dnsmasq script' \
+  'net-libs/gnutls pkcs11 tools' >"$tmp"
 if [[ ! -f /etc/portage/package.use/bitcoin-vm-lab ]] ||
    ! cmp -s "$tmp" /etc/portage/package.use/bitcoin-vm-lab; then
   install -m 0644 "$tmp" /etc/portage/package.use/bitcoin-vm-lab
