@@ -2,24 +2,55 @@
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT/lib/common.sh"
-echo "storage:   $BVML_STORAGE"
+echo "storage: $BVML_STORAGE"
+unsafe=0
 if [[ -f "$CANONICAL" ]]; then
-  echo "canonical: present id=$(canonical_id) protected=$([[ ! -w "$CANONICAL" ]] && echo yes || echo NO)"
-  qemu-img info --backing-chain "$CANONICAL" 2>/dev/null | sed 's/^/           /'
-else echo "canonical: absent"; fi
+  echo "lifecycle: canonical checkpoint ready"
+  echo "canonical: id=$(canonical_id) generation=$(checkpoint_generation) protected=$([[ ! -w "$CANONICAL" ]] && echo yes || echo NO)"
+  qemu-img info --backing-chain "$CANONICAL" 2>/dev/null | sed 's/^/  /'
+elif [[ -f "$BOOTSTRAP" ]]; then
+  case "$(meta_get "$BOOTSTRAP_META" state)" in
+    created) label="fresh bootstrap image created" ;;
+    ibd-in-progress) label="fresh IBD in progress" ;;
+    retained-awaiting-verification) label="bootstrap retained and awaiting verification" ;;
+    verified-complete) label="promotion candidate present" ;;
+    *) label="inconsistent bootstrap state"; unsafe=1 ;;
+  esac
+  echo "lifecycle: $label"
+  echo "bootstrap: id=$(meta_get "$BOOTSTRAP_META" bootstrap_id) initialized=$(meta_get "$BOOTSTRAP_META" filesystem_initialized)"
+else echo "lifecycle: no checkpoint initialized"; fi
+[[ -f "$ROLLBACK" ]] && echo "rollback: available id=$(meta_get "$ROLLBACK_META" id)" || echo "rollback: absent"
 if [[ -f "$OVERLAY" ]]; then
-  echo "overlay:   retained vm=$(overlay_vm) checkpoint=$(meta_get "$OVERLAY_META" canonical_id)"
-  qemu-img info --backing-chain "$OVERLAY" 2>/dev/null | sed 's/^/           /'
-else echo "overlay:   absent"; fi
-owner="$(owner_vm)"
-echo "owner:     ${owner:-none}"
-attached="$(attached_vm_for_path "$OVERLAY" | paste -sd, -)"
-echo "attached:  ${attached:-none}"
+  if [[ -f "$OWNER_FILE" ]]; then label="disposable test overlay active"; else label="disposable test overlay retained"; fi
+  echo "lifecycle: $label"
+  echo "overlay: vm=$(overlay_vm) id=$(overlay_id) generation=$(meta_get "$OVERLAY_META" checkpoint_generation)"
+  qemu-img info --backing-chain "$OVERLAY" 2>/dev/null | sed 's/^/  /'
+else echo "overlay: absent"; fi
+owner="$(owner_vm)"; echo "owner: ${owner:-none}"
+echo "verification: overlay=$([[ -f "$VERIFY_META" ]] && echo present || echo absent) bootstrap=$([[ -f "$BOOTSTRAP_VERIFY" ]] && echo present || echo absent)"
+attached_list=
 for vm in ubuntu umbrel startos; do
-  is_defined "$vm" && printf '%-11s %s\n' "$(domain "$vm"):" "$(domain_state "$vm")" || printf '%-11s undefined\n' "$(domain "$vm"):"
+  state=undefined; is_defined "$vm" && state="$(domain_state "$vm")"
+  printf '%-13s %s\n' "$(domain "$vm"):" "$state"
+  for image in "$OVERLAY" "$BOOTSTRAP" "$CANONICAL" "$ROLLBACK"; do
+    [[ -n "$(attached_vm_for_path "$image")" ]] && attached_list="${attached_list}${vm}:$image "
+  done
+  [[ "$state" == undefined || "$state" == "shut off" ]] || unsafe=1
 done
-if [[ ! -f "$OVERLAY" && ! -f "$OWNER_FILE" && "$(bitcoin_attachment_count)" == 0 ]]; then
-  echo "safe:       start"
-elif [[ -f "$OVERLAY" && ! -f "$OWNER_FILE" && "$(bitcoin_attachment_count)" == 0 ]]; then
-  [[ "$(overlay_vm)" == ubuntu && -f "$VERIFY_META" ]] && echo "safe:       discard or promotion checks" || echo "safe:       discard"
-else echo "safe:       stop/recover ownership; do not discard or promote"; fi
+echo "attachments: ${attached_list:-none}"
+[[ "$(bitcoin_attachment_count)" -le 1 ]] || unsafe=1
+if ((unsafe)); then
+  echo "safety: INCONSISTENT/ACTIVE - no destructive operation is safe"
+elif [[ -f "$OWNER_FILE" ]]; then
+  echo "safety: stop is safe; discard/promotion/rollback are not"
+elif [[ -f "$BOOTSTRAP" ]]; then
+  [[ "$(meta_get "$BOOTSTRAP_META" state)" == verified-complete ]] &&
+    echo "safety: bootstrap promotion or cleanup checks may proceed" ||
+    echo "safety: bootstrap verification/cleanup checks may proceed"
+elif [[ -f "$OVERLAY" ]]; then
+  [[ "$(overlay_vm)" == ubuntu && -f "$VERIFY_META" ]] &&
+    echo "safety: discard or promotion prerequisite checks may proceed" ||
+    echo "safety: discard is safe; promotion is not"
+elif [[ -f "$CANONICAL" ]]; then
+  echo "safety: start or rollback prerequisite checks may proceed"
+else echo "safety: fresh checkpoint bootstrap may proceed"; fi

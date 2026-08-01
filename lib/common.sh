@@ -10,13 +10,21 @@ CANONICAL="$CANONICAL_DIR/bitcoin-mainnet.qcow2"
 CANONICAL_META="$CANONICAL_DIR/manifest.env"
 ROLLBACK="$CANONICAL_DIR/bitcoin-mainnet.rollback.qcow2"
 ROLLBACK_META="$CANONICAL_DIR/rollback-manifest.env"
+if [[ -n "$ROLLBACK_DESTINATION" ]]; then
+  ROLLBACK="$ROLLBACK_DESTINATION/bitcoin-mainnet.rollback.qcow2"
+  ROLLBACK_META="$ROLLBACK_DESTINATION/rollback-manifest.env"
+fi
 ACTIVE_DIR="$BVML_STORAGE/active"
 OVERLAY="$ACTIVE_DIR/bitcoin-mainnet-overlay.qcow2"
 OVERLAY_META="$ACTIVE_DIR/manifest.env"
 VERIFY_META="$ACTIVE_DIR/ubuntu-verification.env"
+BOOTSTRAP="$ACTIVE_DIR/bitcoin-mainnet-bootstrap.qcow2"
+BOOTSTRAP_META="$ACTIVE_DIR/bootstrap-manifest.env"
+BOOTSTRAP_VERIFY="$ACTIVE_DIR/bootstrap-verification.env"
 RUN_DIR="$BVML_STORAGE/run"
 OWNER_FILE="$RUN_DIR/owner.env"
 LOCK_FILE="$RUN_DIR/storage.lock"
+RECOVERY_META="$RUN_DIR/recovery.env"
 
 die() { echo "error: $*" >&2; exit 1; }
 note() { echo "==> $*"; }
@@ -36,6 +44,13 @@ meta_get() {
 overlay_vm() { meta_get "$OVERLAY_META" vm; }
 owner_vm() { meta_get "$OWNER_FILE" vm; }
 canonical_id() { meta_get "$CANONICAL_META" id; }
+overlay_id() { meta_get "$OVERLAY_META" overlay_id; }
+checkpoint_generation() { meta_get "$CANONICAL_META" generation; }
+new_id() {
+  if command -v uuidgen >/dev/null; then uuidgen
+  else printf '%s-%s-%s\n' "$(date +%s%N)" "$$" "$RANDOM" | sha256sum | cut -d' ' -f1
+  fi
+}
 
 init_layout() {
   if [[ "${BVML_TESTING:-0}" == 1 ]]; then
@@ -93,7 +108,7 @@ bitcoin_attachment_count() {
   for vm in ubuntu umbrel startos; do
     is_defined "$vm" || continue
     while IFS= read -r src; do
-      [[ "$src" == "$OVERLAY" || "$src" == "$CANONICAL" || "$src" == "$ROLLBACK" ]] && ((count+=1))
+      [[ "$src" == "$OVERLAY" || "$src" == "$BOOTSTRAP" || "$src" == "$CANONICAL" || "$src" == "$ROLLBACK" ]] && ((count+=1))
     done < <(disk_sources "$vm")
   done
   printf '%s\n' "$count"
@@ -110,15 +125,28 @@ assert_no_extra_overlays() {
   [[ -z "$extra" ]] || die "unexpected extra overlay exists: $extra"
 }
 
+image_immutable() {
+  [[ "${BVML_TESTING:-0}" == 1 ]] && return 0
+  lsattr "$1" 2>/dev/null | awk '{print $1}' | grep -q i
+}
+
 protect_image() {
   local image="$1"
+  [[ -f "$image" ]] || die "image to protect does not exist: $image"
+  if [[ "${BVML_TESTING:-0}" != 1 ]]; then
+    need sudo
+    sudo chattr -i "$image" 2>/dev/null || true
+    sudo chown "$USER:$QEMU_GROUP" "$image"
+  fi
   chmod 0440 "$image"
   if [[ "${BVML_TESTING:-0}" != 1 ]]; then
-    need chattr; need sudo
-    sudo chattr +i "$image" || die "could not set immutable protection on $image"
-    need setfacl
+    need chattr; need setfacl
     setfacl -m "u:$QEMU_USER:r--" "$image" || die "could not grant read-only QEMU access to $image"
+    sudo -u "$QEMU_USER" test -r "$image" || die "system QEMU cannot read $image"
+    sudo chattr +i "$image" || die "could not set immutable protection on $image"
+    image_immutable "$image" || die "immutable protection verification failed for $image"
   fi
+  [[ ! -w "$image" ]] || die "$image remains writable"
 }
 
 unprotect_image() {
@@ -129,8 +157,37 @@ unprotect_image() {
 }
 
 require_canonical() {
-  [[ -f "$CANONICAL" && -f "$CANONICAL_META" ]] || die "canonical checkpoint is missing; run checkpoint-import"
+  [[ -f "$CANONICAL" && -f "$CANONICAL_META" ]] ||
+    die "canonical checkpoint is missing; run checkpoint-bootstrap"
   [[ ! -w "$CANONICAL" ]] || die "canonical checkpoint is writable; run checkpoint-protect"
   [[ -z "$(qemu-img info --output=json "$CANONICAL" | sed -n 's/.*"backing-filename":[[:space:]]*"[^"]*".*/backed/p')" ]] ||
     die "canonical checkpoint unexpectedly has a backing image"
+}
+
+assert_no_process_reference() {
+  local image="$1"
+  [[ "${BVML_TESTING:-0}" == 1 ]] && return 0
+  if command -v lsof >/dev/null && lsof "$image" 2>/dev/null | grep -q .; then
+    die "a process still has $image open"
+  fi
+}
+
+invalidate_verification() {
+  rm -f -- "$VERIFY_META" "$BOOTSTRAP_VERIFY"
+}
+
+validate_checkpoint_image() {
+  local image="$1" xor_bytes
+  qemu-img check "$image" >/dev/null || return 1
+  qemu-img info --output=json "$image" | grep -q '"backing-filename"' && return 1
+  virt-ls -a "$image" -m /dev/sda / | grep -qx blocks || return 1
+  virt-ls -a "$image" -m /dev/sda / | grep -qx chainstate || return 1
+  xor_bytes="$(virt-cat -a "$image" -m /dev/sda /blocks/xor.dat 2>/dev/null |
+    od -An -v -tu1 | tr -s ' ' '\n' | sed '/^$/d' || true)"
+  [[ -z "$xor_bytes" ]] || ! grep -qv '^0$' <<<"$xor_bytes"
+}
+
+image_filesystem_uuid() {
+  virt-filesystems -a "$1" --filesystems --uuid 2>/dev/null |
+    awk 'NR > 1 && $2 != "" {print $2; exit}'
 }

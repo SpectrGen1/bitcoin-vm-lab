@@ -3,12 +3,17 @@ set -Eeuo pipefail
 cmd="$1"; shift
 case "$cmd" in
   create)
-    backing=
-    while (($# > 1)); do
-      [[ "$1" == -b ]] && { backing="$2"; shift 2; continue; }
-      shift
+    backing= out= size=
+    while (($#)); do
+      case "$1" in
+        -f|-F) shift 2 ;;
+        -b) backing="$2"; shift 2 ;;
+        [0-9]*G) size="$1"; shift ;;
+        *) [[ -z "$out" ]] && out="$1"; shift ;;
+      esac
     done
-    out="$1"; printf 'backing=%s\n' "$backing" >"$out"
+    [[ -n "$out" ]] || exit 3
+    printf 'backing=%s\nsize=%s\n' "$backing" "$size" >"$out"
     ;;
   info)
     file="${@: -1}"; backing="$(sed -n 's/^backing=//p' "$file")"
@@ -17,6 +22,10 @@ case "$cmd" in
   check)
     [[ ! -e "$TEST_ROOT/fail-check" ]]
     [[ ! -e "$TEST_ROOT/fail-candidate-check" || "${@: -1}" != *promotion-candidate.qcow2 ]]
+    if [[ -e "$TEST_ROOT/fail-post-install" && "${@: -1}" == *bitcoin-mainnet.qcow2 ]] &&
+       grep -q '^standalone-from=' "${@: -1}"; then exit 1; fi
+    if [[ -e "$TEST_ROOT/fail-rollback-install" && "${@: -1}" == *bitcoin-mainnet.qcow2 ]] &&
+       grep -q '^rollback-image' "${@: -1}"; then exit 1; fi
     ;;
   convert)
     [[ ! -e "$TEST_ROOT/fail-convert" ]] || exit 1

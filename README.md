@@ -1,27 +1,23 @@
 # bitcoin-vm-lab
 
-`bitcoin-vm-lab` runs persistent Ubuntu, UmbrelOS, and StartOS guests
-sequentially under Gentoo's system libvirt. The guests share one protected
-Bitcoin mainnet checkpoint through exactly one disposable qcow2 overlay.
+`bitcoin-vm-lab` manages persistent Ubuntu, UmbrelOS, and StartOS guests
+sequentially under Gentoo system libvirt. One protected Bitcoin mainnet
+checkpoint backs exactly one disposable qcow2 overlay. The canonical image is
+never attached directly.
 
-Generated storage defaults to `/var/lib/libvirt/images/bitcoin-vm-lab`, outside
-the repository and the user's home directory:
+Runtime storage defaults to `/var/lib/libvirt/images/bitcoin-vm-lab`, outside
+the repository:
 
 ```text
 canonical/bitcoin-mainnet.qcow2          protected checkpoint
-canonical/bitcoin-mainnet.rollback.qcow2 previous checkpoint, when available
-active/bitcoin-mainnet-overlay.qcow2     the only disposable overlay
-active/manifest.env                      retained overlay/checkpoint identity
-run/owner.env                            live attachment owner
-vms/{ubuntu,umbrel,startos}/             persistent system/application disks
+canonical/bitcoin-mainnet.rollback.qcow2 optional full-size rollback
+active/bitcoin-mainnet-bootstrap.qcow2   incomplete first-IBD image, when used
+active/bitcoin-mainnet-overlay.qcow2     only disposable test/update overlay
+run/owner.env                            active attachment transaction
+vms/{ubuntu,umbrel,startos}/             persistent OS/application disks
 ```
 
-The canonical image is never attached. `start` creates the single overlay,
-attaches it to one exactly-shut-off domain, records ownership, and boots.
-`stop` waits for exact `shut off`, detaches it, and retains it. No other guest
-can start until the overlay is discarded or promoted.
-
-Start here:
+Fresh Bitcoin Knots mainnet IBD is the normal initialization path:
 
 ```bash
 cp config/local.env.example config/local.env
@@ -29,22 +25,28 @@ sudo ./bin/bvml host-setup
 ./bin/bvml host-validate
 ./bin/bvml init
 ./bin/bvml create ubuntu
-./bin/bvml checkpoint-import
-./bin/bvml start ubuntu
+./bin/bvml checkpoint-bootstrap
+./bin/bvml bootstrap-init --confirm-device-vdc
 ```
 
-The normal initial import reads the existing clean datadir at
-`~/projects/bitcoin-knots-dev/bitcoin`; it does not perform IBD. It streams only
-blocks, chainstate, indexes, and block-format metadata into an image sized from
-actual data plus configured headroom. A live source lock or non-zero
-`blocks/xor.dat` aborts the import.
+The bootstrap disk remains explicitly marked incomplete until authenticated
+Knots, the operator-approved release-specific RDTS profile, mainnet sync,
+indexes, filesystem identity, and clean shutdown evidence all validate.
+`blocksxor=0` is written before the first Knots start. The Ubuntu systemd unit
+requires the expected mounted filesystem and fails closed if the disk or UUID
+is wrong.
 
-Ubuntu uses pinned Bitcoin Knots with explicit, release-validated RDTS
-arguments. UmbrelOS and StartOS use isolated release profiles that bind the
-complete overlay datadir and pinned Knots binary into the packaged application.
-An adapter is not considered configured until its exact package paths/version
-are declared and its in-guest `verify` operation passes.
+An existing datadir is optional and has no default:
 
-See [docs/OPERATIONS.md](docs/OPERATIONS.md) for the full import, guest setup,
-testing, promotion, rollback, recovery, and backup procedures. Run
-`./bin/bvml help` for the command list and `./bin/bvml test` for lifecycle tests.
+```bash
+./bin/bvml checkpoint-import /consistent/snapshot/bitcoin --consistent-snapshot --assert-mainnet
+```
+
+Import rejects XOR block storage and requires an explicit stopped-node or
+snapshot assertion. Umbrel and StartOS adapters are exact-version package
+integrations: Umbrel recreates the actual app container with the overlay and a
+read-only Knots release; StartOS builds an exact package override. Neither is
+reported ready until its actual managed container passes verification.
+
+See [the operations guide](docs/OPERATIONS.md), `./bin/bvml help`, and
+`./bin/bvml test`.

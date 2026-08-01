@@ -16,8 +16,12 @@ case "$cmd" in
     vm="$(vm_from_domain "$1")"; source="$2"; target="$3"
     [[ ! -e "$TEST_ROOT/fail-attach" ]] || exit 1
     printf '%s %s\n' "$target" "$source" >"$TEST_ROOT/attach-$vm"
+    printf 'attach %s %s\n' "$vm" "$source" >>"$TEST_ROOT/virsh.log"
     ;;
-  detach-disk) vm="$(vm_from_domain "$1")"; rm -f -- "$TEST_ROOT/attach-$vm" ;;
+  detach-disk)
+    vm="$(vm_from_domain "$1")"; [[ ! -e "$TEST_ROOT/fail-detach" ]] || exit 1
+    rm -f -- "$TEST_ROOT/attach-$vm"; printf 'detach %s\n' "$vm" >>"$TEST_ROOT/virsh.log"
+    ;;
   start)
     vm="$(vm_from_domain "$1")"; [[ ! -e "$TEST_ROOT/fail-start" ]] || exit 1
     echo running >"$TEST_ROOT/state-$vm"
@@ -26,6 +30,7 @@ case "$cmd" in
     vm="$(vm_from_domain "$1")"
     [[ -e "$TEST_ROOT/stuck-shutdown" ]] || echo 'shut off' >"$TEST_ROOT/state-$vm"
     ;;
+  qemu-agent-command) [[ ! -e "$TEST_ROOT/fail-agent" ]] ;;
   list) : ;;
   *) echo "unsupported fake virsh command: $cmd" >&2; exit 2 ;;
 esac
