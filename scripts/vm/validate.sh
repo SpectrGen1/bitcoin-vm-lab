@@ -6,7 +6,7 @@ failed=0
 bad() { echo "FAIL $*" >&2; failed=1; }
 ok() { echo "ok   $*"; }
 
-for cmd in virsh qemu-img flock sha256sum virt-ls virt-cat virt-customize virt-filesystems; do
+for cmd in virsh qemu-img flock sha256sum jq xmllint virt-ls virt-cat virt-customize virt-filesystems; do
   command -v "$cmd" >/dev/null && ok "command $cmd" || bad "missing command $cmd"
 done
 virshq version >/dev/null 2>&1 && ok "libvirt connectivity" || bad "cannot connect to $LIBVIRT_URI"
@@ -27,15 +27,9 @@ if [[ -d "$BVML_STORAGE" ]]; then
 else bad "storage missing: run bvml init"; fi
 
 if [[ -f "$CANONICAL" ]]; then
-  validate_checkpoint_image "$CANONICAL" && ok "canonical format/layout/non-XOR/standalone" || bad "canonical validation failed"
-  [[ ! -w "$CANONICAL" ]] && ok "canonical mode is read-only" || bad "canonical is writable"
-  [[ "$(stat -c %a "$CANONICAL")" == 440 ]] || bad "canonical mode must be 0440"
-  [[ "$(meta_get "$CANONICAL_META" blocksxor)" == 0 && -n "$(checkpoint_generation)" ]] ||
-    bad "canonical manifest profile/generation incomplete"
-  if [[ "${BVML_TESTING:-0}" == 1 ]] || sudo -u "$QEMU_USER" test -r "$CANONICAL"; then
-    ok "system QEMU can read canonical"
-  else bad "system QEMU cannot read canonical"; fi
-  image_immutable "$CANONICAL" && ok "canonical immutable" || bad "canonical immutable bit absent"
+  canonical_preflight >/dev/null 2>&1 &&
+    ok "canonical full fast preflight (format/layout/profile/protection/QEMU access)" ||
+    bad "canonical full fast preflight failed"
 elif [[ -f "$BOOTSTRAP" ]]; then
   ok "canonical absent while fresh bootstrap is $(meta_get "$BOOTSTRAP_META" state)"
 else
@@ -55,18 +49,9 @@ extra="$(find "$ACTIVE_DIR" -maxdepth 1 -type f -name '*.qcow2' \
 [[ -z "$extra" ]] || bad "unexpected extra overlay: $extra"
 [[ ! -f "$OVERLAY" || ! -f "$BOOTSTRAP" ]] || bad "ordinary overlay and bootstrap coexist"
 
-attachments="$(bitcoin_attachment_count)"
-[[ "$attachments" -le 1 ]] || bad "multiple Bitcoin disk attachments"
-[[ -z "$(attached_vm_for_path "$CANONICAL")" ]] || bad "canonical attached directly"
-owner="$(owner_vm)"
-if [[ -n "$owner" ]]; then
-  attached_path="$(meta_get "$OWNER_FILE" overlay)"
-  attached="$(attached_vm_for_path "$attached_path" | paste -sd, -)"
-  [[ "$owner" == "$attached" ]] || bad "owner/attachment mismatch; use bvml reconcile only after exact shutdown/detach"
-  is_defined "$owner" && ! is_shut_off "$owner" || bad "stale owner for inactive domain"
-else
-  [[ "$attachments" == 0 ]] || bad "Bitcoin disk attached without owner metadata"
-fi
+errors="$(lifecycle_invariant_errors)"
+[[ -z "$errors" ]] && ok "lifecycle owner/manifest/attachment/process invariants" ||
+  bad "lifecycle invariant failure: ${errors//$'\n'/; }"
 
 if [[ -f "$VERIFY_META" ]]; then
   [[ -f "$OVERLAY" && "$(meta_get "$VERIFY_META" overlay_id)" == "$(overlay_id)" ]] ||
@@ -77,13 +62,25 @@ if [[ -f "$BOOTSTRAP_VERIFY" ]]; then
     bad "stale bootstrap verification evidence"
 fi
 
-for v in KNOTS_VERSION KNOTS_ARTIFACT_SHA256 KNOTS_RELEASE_PROFILE KNOTS_RDTS_PROFILE KNOTS_RDTS_PROFILE_SHA256; do
+for v in KNOTS_VERSION_NORMALIZED KNOTS_ARTIFACT_SHA256 KNOTS_RELEASE_PROFILE \
+  KNOTS_RELEASE_PROFILE_SHA256 KNOTS_RDTS_PROFILE KNOTS_RDTS_PROFILE_SHA256 \
+  KNOTS_RDTS_PROFILE_NAME KNOTS_RDTS_REQUIRED_ARGS_JSON; do
   [[ -n "${!v:-}" ]] || bad "$v not configured"
 done
 if [[ -f "$KNOTS_RDTS_PROFILE" && -n "$KNOTS_RDTS_PROFILE_SHA256" ]]; then
   [[ "$(sha256sum "$KNOTS_RDTS_PROFILE" | awk '{print $1}')" == "$KNOTS_RDTS_PROFILE_SHA256" ]] ||
     bad "RDTS profile authenticated digest mismatch"
 fi
+if [[ -f "$KNOTS_RELEASE_PROFILE" && "$KNOTS_RELEASE_PROFILE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
+  [[ "$(sha256sum "$KNOTS_RELEASE_PROFILE" | awk '{print $1}')" == "${KNOTS_RELEASE_PROFILE_SHA256,,}" ]] &&
+    ok "Knots release profile digest" || bad "Knots release profile digest mismatch"
+fi
+jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
+  <<<"$KNOTS_RDTS_REQUIRED_ARGS_JSON" >/dev/null ||
+  bad "host-approved RDTS required arguments must be a nonempty JSON string array"
+validate_checkpoint_profile >/dev/null 2>&1 && ok "checkpoint index profile digest/structure" ||
+  bad "checkpoint index profile is missing, malformed, or has the wrong digest"
+[[ "$MAX_TIP_AGE_SECONDS" =~ ^[1-9][0-9]*$ ]] || bad "MAX_TIP_AGE_SECONDS must be a positive integer"
 for vm in ubuntu umbrel startos; do
   iso_var="${vm^^}_ISO"; sum_var="${vm^^}_ISO_SHA256"; iso="${!iso_var:-}"; sum="${!sum_var:-}"
   [[ -n "$iso" && -f "$iso" && "$sum" =~ ^[0-9a-fA-F]{64}$ ]] ||
@@ -94,8 +91,16 @@ done
 for platform in umbrel startos; do
   [[ -f "$ROOT/templates/$platform/profile.env.example" && -x "$ROOT/scripts/vm/guest/$platform-adapter.sh" ]] ||
     bad "$platform package adapter module missing"
-  profile_var="${platform^^}_SUPPORTED_VERSION"
-  [[ -n "${!profile_var:-}" ]] || bad "$platform exact OS/package profile is not configured (adapter correctly unavailable)"
+  metadata="$ADAPTER_STATE_DIR/$platform.json"
+  if [[ -f "$metadata" ]] && jq -e --arg platform "$platform" '
+    .platform == $platform and .last_validation_result == "ok" and
+    ([.os_version,.package_version,.profile_digest,.knots_binary_digest,
+      .adapter_implementation_version,.validated_at] | all(type == "string" and length > 0))
+  ' "$metadata" >/dev/null; then
+    ok "$platform verified guest adapter profile metadata"
+  else
+    bad "$platform has no current verified guest adapter metadata (adapter remains unavailable)"
+  fi
 done
 
 if [[ -d "$BVML_STORAGE" ]]; then

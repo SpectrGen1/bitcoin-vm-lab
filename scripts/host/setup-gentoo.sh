@@ -19,7 +19,7 @@ fi
 
 emerge --ask app-emulation/qemu app-emulation/libvirt app-emulation/virt-manager \
   app-emulation/libguestfs sys-firmware/edk2-bin sys-apps/acl app-misc/jq \
-  net-misc/bridge-utils sys-fs/e2fsprogs
+  net-misc/bridge-utils sys-fs/e2fsprogs dev-libs/libxml2 sys-process/lsof
 rc-update add libvirtd default
 rc-service libvirtd status >/dev/null 2>&1 || rc-service libvirtd start
 

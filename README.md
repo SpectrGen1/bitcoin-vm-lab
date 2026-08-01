@@ -26,15 +26,21 @@ sudo ./bin/bvml host-setup
 ./bin/bvml init
 ./bin/bvml create ubuntu
 ./bin/bvml checkpoint-bootstrap
-./bin/bvml bootstrap-init --confirm-device-vdc
+./bin/bvml bootstrap-init --confirm-bootstrap-format
 ```
 
 The bootstrap disk remains explicitly marked incomplete until authenticated
-Knots, the operator-approved release-specific RDTS profile, mainnet sync,
-indexes, filesystem identity, and clean shutdown evidence all validate.
+Knots, the operator-approved digest-pinned release-specific RDTS profile,
+mainnet sync, required indexes, best-block freshness, filesystem identity, and
+clean shutdown evidence all validate.
 `blocksxor=0` is written before the first Knots start. The Ubuntu systemd unit
 requires the expected mounted filesystem and fails closed if the disk or UUID
 is wrong.
+
+Formatting is bound to the bootstrap image, not merely `/dev/vdc`: libvirt
+supplies an image-specific serial, and the guest requires its by-id device,
+exact manifest size, host nonce, no child partitions or mounts, and no
+filesystem/partition/RAID/LVM signatures before formatting.
 
 An existing datadir is optional and has no default:
 
@@ -43,10 +49,12 @@ An existing datadir is optional and has no default:
 ```
 
 Import rejects XOR block storage and requires an explicit stopped-node or
-snapshot assertion. Umbrel and StartOS adapters are exact-version package
-integrations: Umbrel recreates the actual app container with the overlay and a
-read-only Knots release; StartOS builds an exact package override. Neither is
-reported ready until its actual managed container passes verification.
+snapshot assertion. Umbrel and StartOS adapters require exact-version,
+digest-pinned implementation scripts that preserve package entrypoints,
+health/dependency interfaces, and integration behavior. Both locate and inspect
+the actual in-container Knots process rather than assuming PID 1. Neither is
+reported ready until its managed package passes verification and the host
+records that guest profile metadata.
 
 See [the operations guide](docs/OPERATIONS.md), `./bin/bvml help`, and
 `./bin/bvml test`.

@@ -4,7 +4,8 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT/lib/common.sh"
 failed=0
 check() { if "$@"; then printf 'ok   %s\n' "$*"; else printf 'FAIL %s\n' "$*" >&2; failed=1; fi; }
-for cmd in virsh qemu-img virt-install virt-make-fs virt-ls flock sha256sum setfacl; do
+for cmd in virsh qemu-img virt-install virt-make-fs virt-ls virt-cat virt-customize \
+  virt-filesystems flock sha256sum setfacl jq xmllint lsof; do
   command -v "$cmd" >/dev/null && printf 'ok   command %s\n' "$cmd" || { echo "FAIL missing command $cmd" >&2; failed=1; }
 done
 check test -c /dev/kvm

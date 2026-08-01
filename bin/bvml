@@ -5,7 +5,7 @@ cmd="${1:-help}"; shift || true
 case "$cmd" in
   host-setup) exec "$ROOT/scripts/host/setup-gentoo.sh" "$@" ;;
   host-validate) exec "$ROOT/scripts/host/validate-gentoo.sh" "$@" ;;
-  init|create|start|stop|discard|reset|reconcile|checkpoint-bootstrap|bootstrap-init|bootstrap-stop|bootstrap-verify|bootstrap-promote|bootstrap-cleanup|bootstrap-status|checkpoint-import|checkpoint-verify|checkpoint-promote|checkpoint-protect|checkpoint-rollback|rollback-remove|adapter-setup|adapter-validate|adapter-status|validate|status)
+  init|create|start|stop|discard|reset|reconcile|checkpoint-bootstrap|bootstrap-init|bootstrap-stop|bootstrap-verify|bootstrap-promote|bootstrap-cleanup|bootstrap-status|checkpoint-import|checkpoint-verify|checkpoint-promote|checkpoint-protect|checkpoint-rollback|rollback-remove|recovery-ack|adapter-setup|adapter-validate|adapter-status|validate|status)
     exec "$ROOT/scripts/vm/manage.sh" "$cmd" "$@" ;;
   test) exec "$ROOT/tests/run.sh" "$@" ;;
   help|-h|--help)
@@ -16,7 +16,7 @@ Commands:
   init                           initialize system-libvirt storage
   create VM                      create a persistent VM from a verified ISO
   checkpoint-bootstrap           create/attach empty fresh-IBD disk to Ubuntu
-  bootstrap-init --confirm-device-vdc
+  bootstrap-init --confirm-bootstrap-format
                                  explicitly initialize the bootstrap filesystem
   bootstrap-stop                 cleanly stop Ubuntu and detach bootstrap disk
   bootstrap-verify               collect image-specific stopped-node evidence
@@ -27,6 +27,7 @@ Commands:
   checkpoint-import SOURCE (--assert-source-stopped|--consistent-snapshot) --assert-mainnet
                                  optionally import a compatible explicit source
   start VM                       create, attach, and boot one fresh overlay
+  start VM --adapter-setup       explicit first-run mode for unverified platform adapter
   stop VM                        cleanly stop, detach, and retain the overlay
   discard [VM]                   discard the inactive overlay
   reset VM                       stop if necessary, then discard the overlay
@@ -38,6 +39,8 @@ Commands:
   checkpoint-rollback            atomically restore the rollback checkpoint
   rollback-remove --confirm-remove
                                  remove an obsolete rollback checkpoint
+  recovery-ack --confirm-reviewed
+                                 clear a proven automatically recovered operation
   adapter-status [VM]            inspect supported guest adapter configuration
   adapter-setup VM               invoke exact package adapter through guest agent
   adapter-validate VM            verify actual managed package/container usage

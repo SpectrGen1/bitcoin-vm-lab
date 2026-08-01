@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "$1" == exec ]]; shift
+container="$1"; shift
+case "$1" in
+  sh)
+    script="$3"
+    if [[ "$script" == *'for proc in /proc/[0-9]*'* ]]; then
+      printf '%s\n' "${FAKE_KNOTS_PID:-42}"
+    else
+      cat "$TEST_ROOT/live-process-args"
+    fi
+    ;;
+  sha256sum) printf '%s  %s\n' "${FAKE_KNOTS_DIGEST:-digest}" "$2" ;;
+  stat) printf '%s\n' "${FAKE_KNOTS_UID:-1000}" ;;
+  *) echo "unexpected fake container command: $*" >&2; exit 2 ;;
+esac

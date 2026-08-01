@@ -30,7 +30,17 @@ case "$cmd" in
     vm="$(vm_from_domain "$1")"
     [[ -e "$TEST_ROOT/stuck-shutdown" ]] || echo 'shut off' >"$TEST_ROOT/state-$vm"
     ;;
-  qemu-agent-command) [[ ! -e "$TEST_ROOT/fail-agent" ]] ;;
+  qemu-agent-command)
+    [[ ! -e "$TEST_ROOT/fail-agent" ]] || exit 1
+    payload="${2:-}"
+    if [[ "$payload" == *guest-exec-status* ]]; then
+      [[ -f "$TEST_ROOT/agent-status.json" ]] &&
+        cat "$TEST_ROOT/agent-status.json" ||
+        printf '{"return":{"exited":true,"exitcode":0}}\n'
+    else
+      printf '{"return":{"pid":42}}\n'
+    fi
+    ;;
   list) : ;;
   *) echo "unsupported fake virsh command: $cmd" >&2; exit 2 ;;
 esac

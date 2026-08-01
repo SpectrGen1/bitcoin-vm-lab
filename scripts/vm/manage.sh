@@ -10,27 +10,21 @@ target_for_source() {
     awk -v wanted="$source" 'NR>2 && $4 == wanted {print $3; exit}'
 }
 
-detach_overlay() {
-  local vm="$1" target
-  target="$(target_for_source "$vm" "$OVERLAY")"
+detach_image() {
+  local vm="$1" image="$2" target
+  target="$(target_for_source "$vm" "$image")"
   [[ -z "$target" ]] || virshq detach-disk "$(domain "$vm")" "$target" --config
 }
 
-write_overlay_meta() {
-  local vm="$1" nonce
-  nonce="$(new_id)"
-  write_env_file "$OVERLAY_META" \
-    "vm=$vm" "canonical_id=$(canonical_id)" "created=$(date -u +%FT%TZ)" \
-    "backing=$CANONICAL" "overlay_id=$nonce" "checkpoint_generation=$(checkpoint_generation)"
-  invalidate_verification
-}
-
-write_owner() {
-  local vm="$1"
+write_owner_record() {
+  local kind="$1" vm="$2" image="$3" identity="$4" serial="$5"
   [[ "${BVML_FAIL_OWNER_WRITE:-0}" != 1 ]] || return 1
-  write_env_file "$OWNER_FILE" "vm=$vm" "domain=$(domain "$vm")" \
-    "overlay=$OVERLAY" "overlay_id=$(overlay_id)" "attached_target=vdc" \
-    "started=$(date -u +%FT%TZ)"
+  write_env_file "$OWNER_FILE" "kind=$kind" "vm=$vm" "domain=$(domain "$vm")" \
+    "image=$image" "overlay=$image" "identity=$identity" "attached_target=vdc" \
+    "disk_serial=$serial" "started=$(date -u +%FT%TZ)"
+  if [[ "$kind" == overlay ]]; then printf 'overlay_id=%s\n' "$identity" >>"$OWNER_FILE"; fi
+  if [[ "$kind" == bootstrap ]]; then printf 'bootstrap_id=%s\n' "$identity" >>"$OWNER_FILE"; fi
+  return 0
 }
 
 assert_overlay_chain() {
@@ -38,6 +32,8 @@ assert_overlay_chain() {
   [[ "$(meta_get "$OVERLAY_META" backing)" == "$CANONICAL" ]] || die "overlay manifest backing path is invalid"
   [[ "$(meta_get "$OVERLAY_META" canonical_id)" == "$(canonical_id)" ]] ||
     die "overlay survived a checkpoint replacement; discard it"
+  [[ "$(meta_get "$OVERLAY_META" checkpoint_generation)" == "$(checkpoint_generation)" ]] ||
+    die "overlay checkpoint generation does not match the canonical checkpoint"
   [[ -n "$(overlay_id)" ]] || die "overlay manifest lacks a unique overlay ID"
   local backing
   backing="$(qemu-img info --output=json "$OVERLAY" | sed -n 's/.*"backing-filename":[[:space:]]*"\([^"]*\)".*/\1/p')"
@@ -45,88 +41,115 @@ assert_overlay_chain() {
 }
 
 assert_consistent_owner() {
-  local owner attached count
-  owner="$(owner_vm)"; attached="$(attached_vm_for_path "$OVERLAY" | paste -sd, -)"
-  count="$(bitcoin_attachment_count)"
-  [[ "$count" -le 1 ]] || die "more than one VM references Bitcoin storage"
-  if [[ -n "$owner" ]]; then
-    [[ -f "$OVERLAY" && "$(overlay_vm)" == "$owner" ]] || die "owner record disagrees with overlay manifest"
-    [[ "$(meta_get "$OWNER_FILE" overlay_id)" == "$(overlay_id)" ]] ||
-      die "owner record belongs to another overlay"
-    [[ "$attached" == "$owner" ]] || die "owner record says $owner but attachment is '${attached:-none}'"
-  elif [[ -n "$attached" ]]; then
-    die "Bitcoin overlay is attached to $attached without an owner record"
-  fi
-  [[ -z "$(attached_vm_for_path "$CANONICAL")" ]] || die "canonical checkpoint is attached directly to a VM"
-  [[ -z "$(attached_vm_for_path "$ROLLBACK")" ]] || die "rollback checkpoint is attached directly to a VM"
+  assert_lifecycle_invariants
 }
 
-start_vm() {
-  local vm="$1"; valid_vm "$vm"; need qemu-img; need virsh
-  require_canonical; is_defined "$vm" || die "VM is not defined: $vm"
-  all_shut_off
-  assert_consistent_owner; assert_no_extra_overlays
-  [[ ! -e "$OVERLAY" && ! -e "$OVERLAY_META" ]] ||
-    die "an overlay for $(overlay_vm || echo unknown) is retained; discard or promote it first"
-  assert_no_bitcoin_attachments
-  qemu-img create -f qcow2 -F qcow2 -b "$CANONICAL" "$OVERLAY"
-  chmod 0640 "$OVERLAY"
+transactional_attach_start() {
+  local kind="$1" vm="$2" image meta identity serial nonce size_bytes
+  case "$kind" in
+    overlay)
+      image="$OVERLAY"; meta="$OVERLAY_META"; identity="$(new_id)"
+      serial="BVMLO-${identity:0:12}"
+      qemu-img create -f qcow2 -F qcow2 -b "$CANONICAL" "$image" ||
+        die "overlay creation failed"
+      write_env_file "$meta" \
+        "kind=overlay" "vm=$vm" "canonical_id=$(canonical_id)" "created=$(date -u +%FT%TZ)" \
+        "backing=$CANONICAL" "overlay_id=$identity" "checkpoint_generation=$(checkpoint_generation)" \
+        "disk_serial=$serial"
+      ;;
+    bootstrap)
+      image="$BOOTSTRAP"; meta="$BOOTSTRAP_META"; identity="$(new_id)"
+      serial="BVMLB-${identity:0:12}"; nonce="$(new_id)"
+      size_bytes=$((BOOTSTRAP_SIZE_GIB * 1073741824))
+      qemu-img create -f qcow2 "$image" "${BOOTSTRAP_SIZE_GIB}G" ||
+        die "bootstrap image creation failed"
+      write_env_file "$meta" "kind=bootstrap" "bootstrap_id=$identity" \
+        "vm=$vm" "created=$(date -u +%FT%TZ)" "size_gib=$BOOTSTRAP_SIZE_GIB" \
+        "size_bytes=$size_bytes" "disk_serial=$serial" "bootstrap_nonce=$nonce" \
+        "filesystem_initialized=0" "state=created"
+      ;;
+    *) die "unsupported transactional image kind: $kind" ;;
+  esac
+  chmod 0640 "$image"
   if [[ "${BVML_TESTING:-0}" != 1 ]]; then
-    setfacl -m "u:$QEMU_USER:rw-" "$OVERLAY" ||
-      { rm -f -- "$OVERLAY"; die "could not grant QEMU overlay access"; }
+    setfacl -m "u:$QEMU_USER:rw-" "$image" ||
+      { rm -f -- "$image" "$meta"; die "could not grant QEMU image access"; }
   fi
-  write_overlay_meta "$vm"
-  if ! virshq attach-disk "$(domain "$vm")" "$OVERLAY" vdc --config \
-      --driver qemu --subdriver qcow2 --targetbus virtio; then
-    rm -f -- "$OVERLAY" "$OVERLAY_META"; die "attachment failed; overlay rolled back"
+  invalidate_verification
+  if ! virshq attach-disk "$(domain "$vm")" "$image" vdc --config \
+      --driver qemu --subdriver qcow2 --targetbus virtio --serial "$serial"; then
+    rm -f -- "$image" "$meta"
+    die "$kind attachment failed; image and manifest rolled back"
   fi
-  if ! write_owner "$vm"; then
-    detach_overlay "$vm" || die "owner write failed and attachment could not be rolled back"
-    [[ -z "$(attached_vm_for_path "$OVERLAY")" ]] ||
-      die "owner write failed and domain XML still references overlay; image retained"
-    rm -f -- "$OVERLAY" "$OVERLAY_META"
-    die "owner write failed; attachment and overlay rolled back"
+  if [[ "$(attached_vm_for_path "$image" | paste -sd, -)" != "$vm" ||
+        "$(attachment_serial_for_path "$vm" "$image")" != "$serial" ]]; then
+    if detach_image "$vm" "$image" && [[ -z "$(attached_vm_for_path "$image")" ]]; then
+      assert_no_process_reference "$image"
+      rm -f -- "$image" "$meta"
+      die "$kind attachment identity verification failed; attachment and files rolled back"
+    fi
+    write_owner_record "$kind" "$vm" "$image" "$identity" "$serial" ||
+      write_env_file "$RECOVERY_META" "operation=attachment-verification" "kind=$kind" \
+        "vm=$vm" "image=$image" "identity=$identity" "disk_serial=$serial"
+    die "$kind attachment identity verification failed and detach failed; recoverable state was retained"
+  fi
+  if ! write_owner_record "$kind" "$vm" "$image" "$identity" "$serial"; then
+    local original="$kind owner metadata write failed"
+    detach_image "$vm" "$image" ||
+      die "$original; detach also failed, so image and manifest were retained"
+    [[ -z "$(attached_vm_for_path "$image")" ]] ||
+      die "$original; domain XML still references the image, so it was retained"
+    assert_no_process_reference "$image"
+    rm -f -- "$image" "$meta"
+    die "$original; attachment, image, and manifest rolled back"
   fi
   if ! virshq start "$(domain "$vm")"; then
     if is_shut_off "$vm"; then
-      detach_overlay "$vm" || die "VM start failed and detach failed; overlay and owner retained"
-      [[ -z "$(attached_vm_for_path "$OVERLAY")" ]] ||
-        die "VM start failed and domain XML still references overlay; state retained"
-      rm -f -- "$OVERLAY" "$OVERLAY_META" "$OWNER_FILE" "$VERIFY_META"
-      die "VM start failed; attachment, overlay, and owner were rolled back"
+      detach_image "$vm" "$image" || die "VM start failed and detach failed; state retained"
+      [[ -z "$(attached_vm_for_path "$image")" ]] ||
+        die "VM start failed and domain XML still references image; state retained"
+      assert_no_process_reference "$image"
+      rm -f -- "$image" "$meta" "$OWNER_FILE" "$VERIFY_META" "$BOOTSTRAP_VERIFY"
+      die "VM start failed; attachment, image, manifest, and owner were rolled back"
     fi
     die "VM start returned failure but domain is active; state retained for safe recovery"
   fi
+}
+
+start_vm() {
+  local vm="$1" mode="${2:-}"
+  valid_vm "$vm"; need qemu-img; need virsh
+  [[ -z "$mode" || "$mode" == --adapter-setup ]] || die "unsupported start option: $mode"
+  if [[ "$vm" != ubuntu ]]; then
+    if [[ "$mode" == --adapter-setup ]]; then
+      note "$vm is entering explicit unverified adapter-setup mode"
+    else
+      jq -e --arg platform "$vm" '.platform == $platform and .last_validation_result == "ok"' \
+        "$ADAPTER_STATE_DIR/$vm.json" >/dev/null 2>&1 ||
+        die "$vm adapter is not verified; use 'start $vm --adapter-setup', then adapter-setup/adapter-validate"
+    fi
+  elif [[ -n "$mode" ]]; then
+    die "--adapter-setup is only valid for UmbrelOS or StartOS"
+  fi
+  canonical_preflight; is_defined "$vm" || die "VM is not defined: $vm"
+  all_shut_off
+  [[ -e "$OVERLAY" || -e "$OVERLAY_META" ]] || rm -f -- "$VERIFY_META"
+  assert_consistent_owner; assert_no_extra_overlays
+  [[ ! -e "$OVERLAY" && ! -e "$OVERLAY_META" && ! -e "$BOOTSTRAP" && ! -e "$BOOTSTRAP_META" ]] ||
+    die "Bitcoin working state is retained; discard, clean up, or promote it first"
+  assert_no_bitcoin_attachments
+  transactional_attach_start overlay "$vm"
   note "$vm started with the single disposable overlay"
 }
 
 guest_application_stop() {
-  local vm="$1"
-  [[ "${BVML_TESTING:-0}" == 1 ]] && return 0
-  need jq
-  local script
+  local vm="$1" script
   case "$vm" in
     ubuntu) script=/usr/local/libexec/bvml/ubuntu-knots-rdts.sh ;;
     umbrel) script=/usr/local/libexec/bvml/umbrel-adapter.sh ;;
     startos) script=/usr/local/libexec/bvml/startos-adapter.sh ;;
   esac
-  local response pid status waited=0
-  response="$(virshq qemu-agent-command "$(domain "$vm")" \
-    "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"$script\",\"arg\":[\"stop\"],\"capture-output\":true}}" \
-    2>/dev/null)" || die "could not request clean $vm Bitcoin shutdown through QEMU guest agent"
-  pid="$(jq -er '.return.pid' <<<"$response")" || die "guest agent did not return an application-stop PID"
-  while :; do
-    status="$(virshq qemu-agent-command "$(domain "$vm")" \
-      "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}" 2>/dev/null)" ||
-      die "lost guest-agent status while waiting for $vm Bitcoin shutdown"
-    if [[ "$(jq -r '.return.exited // false' <<<"$status")" == true ]]; then
-      [[ "$(jq -r '.return.exitcode // 1' <<<"$status")" == 0 ]] ||
-        die "$vm Bitcoin shutdown hook failed; guest and attachment retained"
-      break
-    fi
-    (( waited++ < SHUTDOWN_TIMEOUT )) || die "$vm Bitcoin shutdown hook timed out"
-    sleep 1
-  done
+  guest_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" stop
 }
 
 stop_vm() {
@@ -141,7 +164,7 @@ stop_vm() {
       sleep 2; ((waited+=2))
     done
   fi
-  detach_overlay "$vm"
+  detach_image "$vm" "$OVERLAY"
   [[ -z "$(attached_vm_for_path "$OVERLAY")" ]] || die "overlay still attached; ownership retained"
   assert_no_process_reference "$OVERLAY"
   rm -f -- "$OWNER_FILE"
@@ -161,17 +184,31 @@ discard_overlay() {
 }
 
 reconcile_owner() {
-  local attached owner
+  local attached owner kind image meta manifest_vm manifest_id owner_id manifest_serial owner_serial
   all_shut_off
-  attached="$(attached_vm_for_path "$OVERLAY" | paste -sd, -)"
-  [[ -z "$attached" ]] || die "cannot reconcile: overlay remains attached to $attached"
-  assert_no_process_reference "$OVERLAY"
   owner="$(owner_vm)"
   if [[ -n "$owner" ]]; then
-    [[ -f "$OVERLAY" && "$(overlay_vm)" == "$owner" ]] ||
-      die "owner cannot be reconciled automatically: overlay manifest disagrees"
+    kind="$(owner_kind)"; image="$(owner_image)"; owner_id="$(meta_get "$OWNER_FILE" identity)"
+    case "$kind" in
+      overlay) meta="$OVERLAY_META"; manifest_vm="$(overlay_vm)"; manifest_id="$(overlay_id)";
+        [[ "$image" == "$OVERLAY" ]] || die "stale overlay owner has an unexpected image path" ;;
+      bootstrap) meta="$BOOTSTRAP_META"; manifest_vm="$(meta_get "$meta" vm)";
+        manifest_id="$(meta_get "$meta" bootstrap_id)"
+        [[ "$image" == "$BOOTSTRAP" ]] || die "stale bootstrap owner has an unexpected image path" ;;
+      *) die "owner kind is missing or unsupported; automatic reconciliation is unsafe" ;;
+    esac
+    manifest_serial="$(meta_get "$meta" disk_serial)"
+    owner_serial="$(meta_get "$OWNER_FILE" disk_serial)"
+    attached="$(attached_vm_for_path "$image" | paste -sd, -)"
+    [[ -z "$attached" ]] || die "cannot reconcile: $kind image remains attached to $attached"
+    assert_no_process_reference "$image"
+    [[ -f "$image" && -f "$meta" && "$manifest_vm" == "$owner" && "$manifest_id" == "$owner_id" &&
+       -n "$owner_serial" && "$manifest_serial" == "$owner_serial" ]] ||
+      die "owner cannot be reconciled automatically: $kind image/manifest disagrees"
+    [[ "$(bitcoin_attachment_count)" == 0 ]] || die "conflicting Bitcoin storage attachment exists"
+    [[ ! -f "$OVERLAY" || ! -f "$BOOTSTRAP" ]] || die "bootstrap and ordinary overlay coexist"
     rm -f -- "$OWNER_FILE"
-    note "cleared stale inactive owner record for retained $owner overlay"
+    note "cleared stale detached $kind owner for retained $owner image"
   else note "owner state is already reconciled"; fi
 }
 
@@ -179,40 +216,10 @@ bootstrap_attached_vm() { attached_vm_for_path "$BOOTSTRAP"; }
 
 checkpoint_bootstrap() {
   need qemu-img; need virsh
-  [[ ! -e "$CANONICAL" && ! -e "$CANONICAL_META" ]] ||
-    die "canonical checkpoint already exists; use an Ubuntu overlay to update it"
-  all_shut_off; assert_no_bitcoin_attachments
-  [[ ! -e "$OVERLAY" && ! -e "$OVERLAY_META" && ! -e "$OWNER_FILE" ]] ||
-    die "ordinary overlay/owner state exists"
-  [[ ! -e "$BOOTSTRAP" && ! -e "$BOOTSTRAP_META" ]] ||
-    die "bootstrap state already exists; inspect bootstrap-status"
+  assert_initialization_state_empty "fresh bootstrap"
   [[ "$BOOTSTRAP_SIZE_GIB" =~ ^[1-9][0-9]*$ ]] || die "BOOTSTRAP_SIZE_GIB must be a positive integer"
   is_defined ubuntu || die "Ubuntu VM is not defined"
-  local bootstrap_id
-  bootstrap_id="$(new_id)"
-  qemu-img create -f qcow2 "$BOOTSTRAP" "${BOOTSTRAP_SIZE_GIB}G"
-  chmod 0640 "$BOOTSTRAP"
-  write_env_file "$BOOTSTRAP_META" "kind=fresh-ibd-incomplete" "bootstrap_id=$bootstrap_id" \
-    "vm=ubuntu" "created=$(date -u +%FT%TZ)" "size_gib=$BOOTSTRAP_SIZE_GIB" \
-    "filesystem_initialized=0" "state=created"
-  invalidate_verification
-  if ! virshq attach-disk "$(domain ubuntu)" "$BOOTSTRAP" vdc --config \
-      --driver qemu --subdriver qcow2 --targetbus virtio; then
-    rm -f -- "$BOOTSTRAP" "$BOOTSTRAP_META"
-    die "bootstrap attachment failed; image rolled back"
-  fi
-  write_env_file "$OWNER_FILE" "vm=ubuntu" "domain=$(domain ubuntu)" "overlay=$BOOTSTRAP" \
-    "bootstrap_id=$bootstrap_id" "attached_target=vdc" "kind=bootstrap"
-  if ! virshq start "$(domain ubuntu)"; then
-    if is_shut_off ubuntu; then
-      virshq detach-disk "$(domain ubuntu)" vdc --config ||
-        die "Ubuntu start failed and bootstrap detach failed; state retained"
-      [[ -z "$(bootstrap_attached_vm)" ]] ||
-        die "Ubuntu XML still references bootstrap; state retained"
-      rm -f -- "$BOOTSTRAP" "$BOOTSTRAP_META" "$OWNER_FILE"
-    fi
-    die "Ubuntu bootstrap start failed"
-  fi
+  transactional_attach_start bootstrap ubuntu
   note "empty, unformatted bootstrap image attached; run bootstrap-init explicitly inside the new Ubuntu lifecycle"
 }
 
@@ -223,36 +230,29 @@ bootstrap_init() {
   [[ ! "$(is_shut_off ubuntu && echo yes)" == yes ]] || die "Ubuntu must be running for filesystem initialization"
   [[ "$(meta_get "$BOOTSTRAP_META" filesystem_initialized)" == 0 ]] ||
     die "bootstrap filesystem is already initialized"
-  [[ "${1:-}" == "--confirm-device-vdc" && $# == 1 ]] ||
-    die "explicit disk initialization requires --confirm-device-vdc"
-  if [[ "${BVML_TESTING:-0}" != 1 ]]; then
-    need jq
-    local response pid status waited=0
-    response="$(virshq qemu-agent-command "$(domain ubuntu)" \
-      '{"execute":"guest-exec","arguments":{"path":"/usr/local/libexec/bvml/ubuntu-knots-rdts.sh","arg":["init-filesystem","--confirm-device-vdc"],"capture-output":true}}' \
-      2>/dev/null)" || die "guest filesystem initialization request failed"
-    pid="$(jq -er '.return.pid' <<<"$response")" || die "guest agent returned no filesystem-initialization PID"
-    while :; do
-      status="$(virshq qemu-agent-command "$(domain ubuntu)" \
-        "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":$pid}}" 2>/dev/null)" ||
-        die "lost guest-agent status during filesystem initialization"
-      if [[ "$(jq -r '.return.exited // false' <<<"$status")" == true ]]; then
-        [[ "$(jq -r '.return.exitcode // 1' <<<"$status")" == 0 ]] ||
-          die "guest refused or failed filesystem initialization; bootstrap remains uninitialized"
-        break
-      fi
-      (( waited++ < SHUTDOWN_TIMEOUT )) || die "filesystem initialization timed out"
-      sleep 1
-    done
-  fi
+  [[ "${1:-}" == "--confirm-bootstrap-format" && $# == 1 ]] ||
+    die "explicit disk initialization requires --confirm-bootstrap-format"
+  guest_exec_sync ubuntu /usr/local/libexec/bvml/ubuntu-knots-rdts.sh 30 \
+    stage-bootstrap \
+    "$(meta_get "$BOOTSTRAP_META" bootstrap_id)" \
+    "$(meta_get "$BOOTSTRAP_META" disk_serial)" \
+    "$(meta_get "$BOOTSTRAP_META" size_bytes)" \
+    "$(meta_get "$BOOTSTRAP_META" bootstrap_nonce)"
+  guest_exec_sync ubuntu /usr/local/libexec/bvml/ubuntu-knots-rdts.sh "$GUEST_EXEC_TIMEOUT" \
+    init-filesystem --confirm-bootstrap-format \
+    "$(meta_get "$BOOTSTRAP_META" bootstrap_id)" \
+    "$(meta_get "$BOOTSTRAP_META" disk_serial)" \
+    "$(meta_get "$BOOTSTRAP_META" size_bytes)" \
+    "$(meta_get "$BOOTSTRAP_META" bootstrap_nonce)"
   sed -i 's/^filesystem_initialized=.*/filesystem_initialized=1/;s/^state=.*/state=ibd-in-progress/' "$BOOTSTRAP_META"
-  note "bootstrap filesystem initialization explicitly requested; verify guest completion before starting Knots"
+  note "bootstrap filesystem initialized after guest identity and signature checks completed"
 }
 
 bootstrap_stop() {
   local waited=0
   [[ "$(meta_get "$OWNER_FILE" kind)" == bootstrap && "$(owner_vm)" == ubuntu ]] ||
     die "Ubuntu does not own an active bootstrap image"
+  assert_consistent_owner
   if ! is_shut_off ubuntu; then
     guest_application_stop ubuntu
     virshq shutdown "$(domain ubuntu)"
@@ -261,7 +261,7 @@ bootstrap_stop() {
       sleep 2; ((waited+=2))
     done
   fi
-  virshq detach-disk "$(domain ubuntu)" vdc --config ||
+  detach_image ubuntu "$BOOTSTRAP" ||
     die "bootstrap detach failed; ownership retained"
   [[ -z "$(bootstrap_attached_vm)" ]] || die "bootstrap remains attached; ownership retained"
   assert_no_process_reference "$BOOTSTRAP"
@@ -300,24 +300,33 @@ bootstrap_promote() {
   all_shut_off; assert_no_bitcoin_attachments; [[ ! -e "$OWNER_FILE" ]] || die "bootstrap owner remains"
   assert_no_process_reference "$BOOTSTRAP"
   verify_promotion_evidence "$BOOTSTRAP_VERIFY" bootstrap
-  need virt-customize
-  virt-customize -a "$BOOTSTRAP" --rm /.bvml/ubuntu-verification.env >/dev/null ||
-    die "could not remove transient verification evidence from bootstrap"
-  validate_checkpoint_image "$BOOTSTRAP" || die "completed bootstrap image validation failed"
+  need virt-customize; need qemu-img
+  rm -f -- "$BOOTSTRAP_CANDIDATE" "$BOOTSTRAP_CANDIDATE_META"
+  qemu-img convert -p -O qcow2 "$BOOTSTRAP" "$BOOTSTRAP_CANDIDATE" ||
+    die "bootstrap conversion failed; verified bootstrap and evidence are unchanged"
+  virt-customize -a "$BOOTSTRAP_CANDIDATE" --rm /.bvml/ubuntu-verification.env >/dev/null ||
+    { rm -f -- "$BOOTSTRAP_CANDIDATE"; die "candidate evidence cleanup failed; verified bootstrap is unchanged"; }
+  validate_checkpoint_image "$BOOTSTRAP_CANDIDATE" ||
+    { rm -f -- "$BOOTSTRAP_CANDIDATE"; die "bootstrap candidate validation failed; verified bootstrap is unchanged"; }
   local generation id
-  id="$(sha256sum "$BOOTSTRAP" | awk '{print $1}')"; generation="$(new_id)"
-  write_env_file "$CANONICAL_DIR/bootstrap-install-manifest.env" "id=$id" "generation=$generation" \
+  id="$(sha256sum "$BOOTSTRAP_CANDIDATE" | awk '{print $1}')"; generation="$(new_id)"
+  validate_checkpoint_profile
+  write_env_file "$BOOTSTRAP_CANDIDATE_META" "id=$id" "generation=$generation" \
     "created=$(date -u +%FT%TZ)" "network=main" "blocksxor=0" "layout=root-datadir" \
-    "kind=fresh-knots-rdts-ibd" "knots_version=$(meta_get "$BOOTSTRAP_VERIFY" knots_actual_version)"
-  rm -f -- "$BOOTSTRAP_VERIFY"
-  mv -- "$BOOTSTRAP" "$CANONICAL"
-  mv -- "$CANONICAL_DIR/bootstrap-install-manifest.env" "$CANONICAL_META"
-  if ! (protect_image "$CANONICAL" && validate_checkpoint_image "$CANONICAL"); then
+    "kind=fresh-knots-rdts-ibd" "knots_version_normalized=$(meta_get "$BOOTSTRAP_VERIFY" knots_version_normalized)" \
+    "checkpoint_profile_id=$(checkpoint_profile_id)" \
+    "checkpoint_profile_sha256=${CHECKPOINT_PROFILE_SHA256,,}"
+  mv -- "$BOOTSTRAP_CANDIDATE" "$CANONICAL"
+  mv -- "$BOOTSTRAP_CANDIDATE_META" "$CANONICAL_META"
+  if ! (protect_image "$CANONICAL" && canonical_preflight); then
     unprotect_image "$CANONICAL" || true
-    mv -- "$CANONICAL" "$BOOTSTRAP"; mv -- "$CANONICAL_META" "$CANONICAL_DIR/bootstrap-install-manifest.env"
-    die "bootstrap installation/protection failed; incomplete image restored at bootstrap path"
+    mv -- "$CANONICAL" "$BOOTSTRAP_CANDIDATE"
+    mv -- "$CANONICAL_META" "$BOOTSTRAP_CANDIDATE_META"
+    write_env_file "$RECOVERY_META" "operation=bootstrap-promotion" "result=source-preserved" \
+      "bootstrap_id=$(meta_get "$BOOTSTRAP_META" bootstrap_id)"
+    die "bootstrap installation/protection failed; original verified bootstrap and evidence remain retryable"
   fi
-  rm -f -- "$BOOTSTRAP_META"
+  rm -f -- "$BOOTSTRAP" "$BOOTSTRAP_META" "$BOOTSTRAP_VERIFY" "$RECOVERY_META"
   note "fresh Knots/RDTS IBD installed as the first protected canonical checkpoint"
 }
 
@@ -325,7 +334,11 @@ bootstrap_cleanup() {
   all_shut_off; [[ -z "$(bootstrap_attached_vm)" ]] || die "bootstrap remains attached"
   [[ ! -e "$OWNER_FILE" ]] || die "owner remains; reconcile or stop first"
   assert_no_process_reference "$BOOTSTRAP"
-  rm -f -- "$BOOTSTRAP" "$BOOTSTRAP_META" "$BOOTSTRAP_VERIFY"
+  rm -f -- "$BOOTSTRAP" "$BOOTSTRAP_META" "$BOOTSTRAP_VERIFY" \
+    "$BOOTSTRAP_CANDIDATE" "$BOOTSTRAP_CANDIDATE_META"
+  if [[ "$(meta_get "$RECOVERY_META" operation)" == bootstrap-promotion ]]; then
+    rm -f -- "$RECOVERY_META"
+  fi
   note "incomplete bootstrap state removed"
 }
 
@@ -360,12 +373,12 @@ checkpoint_import() {
     *) [[ -z "$source" ]] || die "only one import source may be supplied"; source="$1"; shift ;;
   esac; done
   [[ -n "$source" ]] || die "checkpoint-import requires an explicit source path"
+  [[ "$source" == /* && "$source" != *$'\n'* && "$source" != *$'\r'* ]] ||
+    die "checkpoint-import source must be an absolute path without control characters"
   [[ -n "$source_mode" ]] || die "assert a clean stop or consistent snapshot explicitly"
   (( mainnet_asserted == 1 )) || die "explicit --assert-mainnet is required after source validation"
   need qemu-img; need virt-make-fs; need virt-ls; need virt-customize; need tar
-  all_shut_off; assert_no_bitcoin_attachments
-  [[ ! -e "$OVERLAY" && ! -e "$OWNER_FILE" ]] || die "discard the active overlay before initial import"
-  [[ ! -e "$CANONICAL" ]] || die "canonical checkpoint already exists"
+  assert_initialization_state_empty "checkpoint import"
   [[ -d "$source" ]] || die "source datadir does not exist: $source"
   if [[ "$source_mode" == stopped ]]; then
     [[ ! -e "$source/.lock" ]] ||
@@ -375,7 +388,7 @@ checkpoint_import() {
     fi
   fi
   source_xor_check "$source"
-  local candidate="$CANONICAL_DIR/import-candidate.qcow2" bytes size_bytes id generation
+  local candidate="$IMPORT_CANDIDATE" bytes size_bytes id generation
   rm -f -- "$candidate"
   local import_paths=(blocks chainstate)
   [[ ! -d "$source/indexes" ]] || import_paths+=(indexes)
@@ -393,21 +406,24 @@ checkpoint_import() {
   qemu-img check "$candidate"
   virt-ls -a "$candidate" -m /dev/sda / | grep -qx blocks || die "candidate lacks blocks/"
   virt-ls -a "$candidate" -m /dev/sda / | grep -qx chainstate || die "candidate lacks chainstate/"
-  if [[ "$CHECKPOINT_INDEX_PROFILE" != none ]]; then
+  validate_checkpoint_profile
+  if [[ "$(checkpoint_profile_indexes_json)" != '[]' ]]; then
     virt-ls -a "$candidate" -m /dev/sda / | grep -qx indexes || die "candidate lacks verified indexes/"
   fi
   id="$(sha256sum "$candidate" | awk '{print $1}')"
   generation="$(new_id)"
-  write_env_file "$CANONICAL_DIR/import-manifest.env" \
+  write_env_file "$IMPORT_META" \
     "id=$id" "generation=$generation" "created=$(date -u +%FT%TZ)" \
     "source=$source" "source_consistency=$source_mode" "source_network_assertion=mainnet" \
     "source_bytes=$bytes" "image_bytes=$size_bytes" \
-    "network=main" "blocksxor=0" "layout=root-datadir" "kind=initial-import"
+    "network=main" "blocksxor=0" "layout=root-datadir" "kind=initial-import" \
+    "checkpoint_profile_id=$(checkpoint_profile_id)" \
+    "checkpoint_profile_sha256=${CHECKPOINT_PROFILE_SHA256,,}"
   mv -- "$candidate" "$CANONICAL"
-  mv -- "$CANONICAL_DIR/import-manifest.env" "$CANONICAL_META"
+  mv -- "$IMPORT_META" "$CANONICAL_META"
   if ! (protect_image "$CANONICAL" && validate_checkpoint_image "$CANONICAL"); then
     unprotect_image "$CANONICAL" || true
-    mv -- "$CANONICAL" "$candidate"; mv -- "$CANONICAL_META" "$CANONICAL_DIR/import-manifest.env"
+    mv -- "$CANONICAL" "$candidate"; mv -- "$CANONICAL_META" "$IMPORT_META"
     die "import installation/protection failed; candidate restored without canonical state"
   fi
   note "protected canonical checkpoint imported from $source"
@@ -417,8 +433,10 @@ verify_promotion_evidence() {
   local evidence="${1:-$VERIFY_META}" kind="${2:-overlay}" key expected
   [[ -f "$evidence" ]] || die "missing current Ubuntu Knots verification evidence"
   for key in vm network blocksxor synced clean_shutdown datadir_layout rdts_validated \
-    knots_actual_version artifact_sha256 rdts_profile rdts_effective_args block_height \
-    header_height best_block_hash tip_time filesystem_uuid indexes_json index_sync_json shutdown_id; do
+    knots_version_normalized artifact_sha256 rdts_profile_name rdts_profile_sha256 \
+    rdts_observed_args_json block_height header_height best_block_hash best_block_time \
+    median_time tip_age_seconds max_tip_age_seconds verified_epoch filesystem_uuid \
+    checkpoint_profile_id checkpoint_profile_sha256 index_state_json shutdown_id; do
     [[ -n "$(meta_get "$evidence" "$key")" ]] || die "verification metadata missing $key"
   done
   for expected in "vm=ubuntu" "network=main" "blocksxor=0" "synced=1" \
@@ -426,16 +444,52 @@ verify_promotion_evidence() {
     [[ "$(meta_get "$evidence" "${expected%%=*}")" == "${expected#*=}" ]] ||
       die "verification requirement failed: $expected"
   done
-  [[ "$(meta_get "$evidence" knots_actual_version)" == "$KNOTS_VERSION" ]] ||
-    die "actual Knots version does not match configured release"
+  [[ -n "$KNOTS_VERSION_NORMALIZED" ]] || die "KNOTS_VERSION_NORMALIZED is not configured"
+  [[ "$(meta_get "$evidence" knots_version_normalized)" == "$KNOTS_VERSION_NORMALIZED" ]] ||
+    die "normalized Knots version does not match configured release"
   [[ "$(meta_get "$evidence" artifact_sha256)" == "$KNOTS_ARTIFACT_SHA256" ]] ||
     die "artifact digest does not match authenticated release configuration"
-  [[ "$(meta_get "$evidence" rdts_profile)" == "$KNOTS_RDTS_PROFILE" ]] ||
-    die "verification used another RDTS profile"
+  [[ "$(meta_get "$evidence" rdts_profile_sha256)" == "${KNOTS_RDTS_PROFILE_SHA256,,}" ]] ||
+    die "verification used another RDTS profile digest"
+  [[ -n "$KNOTS_RDTS_PROFILE_NAME" &&
+     "$(meta_get "$evidence" rdts_profile_name)" == "$KNOTS_RDTS_PROFILE_NAME" ]] ||
+    die "verification used another RDTS profile name"
+  jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
+    <<<"$KNOTS_RDTS_REQUIRED_ARGS_JSON" >/dev/null ||
+    die "host approved RDTS required-argument JSON is missing or invalid"
+  jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
+    <<<"$(meta_get "$evidence" rdts_observed_args_json)" >/dev/null ||
+    die "observed RDTS evidence is not a nonempty JSON string array"
+  local observed_rdts_sorted approved_rdts_sorted
+  observed_rdts_sorted="$(jq -c 'sort' <<<"$(meta_get "$evidence" rdts_observed_args_json)")"
+  approved_rdts_sorted="$(jq -c 'sort' <<<"$KNOTS_RDTS_REQUIRED_ARGS_JSON")"
+  [[ "$observed_rdts_sorted" == "$approved_rdts_sorted" ]] ||
+    die "observed runtime RDTS arguments do not exactly match the host-approved set"
   [[ "$(meta_get "$evidence" block_height)" == "$(meta_get "$evidence" header_height)" ]] ||
     die "block and header heights differ"
-  [[ "$(meta_get "$evidence" index_sync_json)" != *false* ]] ||
-    die "one or more required indexes are unsynchronized"
+  validate_checkpoint_profile
+  [[ "$(meta_get "$evidence" checkpoint_profile_id)" == "$(checkpoint_profile_id)" ]] ||
+    die "verification used another checkpoint index profile"
+  [[ "$(meta_get "$evidence" checkpoint_profile_sha256)" == "${CHECKPOINT_PROFILE_SHA256,,}" ]] ||
+    die "verification checkpoint profile digest mismatch"
+  local expected_indexes index_state now best_time max_age
+  expected_indexes="$(checkpoint_profile_indexes_json)"
+  index_state="$(meta_get "$evidence" index_state_json)"
+  jq -e --argjson expected "$expected_indexes" '
+    . as $state |
+    type == "object" and
+    all($expected[]; $state[.] != null and $state[.].synced == true) and
+    all(to_entries[]; (.value.synced // false) == true)
+  ' <<<"$index_state" >/dev/null || die "required index set is missing, conflicting, or unsynchronized"
+  best_time="$(meta_get "$evidence" best_block_time)"
+  max_age="$(meta_get "$evidence" max_tip_age_seconds)"
+  [[ "$best_time" =~ ^[0-9]+$ && "$max_age" =~ ^[0-9]+$ ]] ||
+    die "verification tip freshness fields are invalid"
+  [[ "$max_age" == "$MAX_TIP_AGE_SECONDS" ]] ||
+    die "verification used another maximum tip age"
+  now="$(date +%s)"
+  (( now >= best_time && now - best_time <= MAX_TIP_AGE_SECONDS )) ||
+    die "verified chain tip is now older than the configured ${MAX_TIP_AGE_SECONDS}s limit"
   if [[ "$kind" == overlay ]]; then
     [[ "$(meta_get "$evidence" overlay_id)" == "$(overlay_id)" ]] ||
       die "verification belongs to another overlay"
@@ -445,17 +499,6 @@ verify_promotion_evidence() {
     [[ "$(meta_get "$evidence" bootstrap_id)" == "$(meta_get "$BOOTSTRAP_META" bootstrap_id)" ]] ||
       die "verification belongs to another bootstrap"
   fi
-}
-
-validate_checkpoint_image() {
-  local image="$1" xor_bytes
-  qemu-img check "$image" >/dev/null || return 1
-  qemu-img info --output=json "$image" | grep -q '"backing-filename"' && return 1
-  virt-ls -a "$image" -m /dev/sda / | grep -qx blocks || return 1
-  virt-ls -a "$image" -m /dev/sda / | grep -qx chainstate || return 1
-  xor_bytes="$(virt-cat -a "$image" -m /dev/sda /blocks/xor.dat 2>/dev/null |
-    od -An -v -tu1 | tr -s ' ' '\n' | sed '/^$/d' || true)"
-  [[ -z "$xor_bytes" ]] || ! grep -qv '^0$' <<<"$xor_bytes"
 }
 
 checkpoint_verify() {
@@ -496,7 +539,9 @@ checkpoint_promote() {
   write_env_file "$candidate_meta" "id=$id" "created=$(date -u +%FT%TZ)" \
     "generation=$(new_id)" \
     "network=main" "blocksxor=0" "layout=root-datadir" "kind=knots-rdts-promotion" \
-    "knots_version=$(meta_get "$VERIFY_META" knots_actual_version)"
+    "knots_version_normalized=$(meta_get "$VERIFY_META" knots_version_normalized)" \
+    "checkpoint_profile_id=$(checkpoint_profile_id)" \
+    "checkpoint_profile_sha256=${CHECKPOINT_PROFILE_SHA256,,}"
   local required available pending="$CANONICAL_DIR/previous-canonical.pending"
   local pending_meta="$CANONICAL_DIR/previous-manifest.pending"
   required="$(du -B1 "$CANONICAL" | awk '{print $1}')"
@@ -598,12 +643,47 @@ rollback_remove() {
   note "obsolete rollback checkpoint removed"
 }
 
+recovery_ack() {
+  [[ "${1:-}" == --confirm-reviewed && $# == 1 ]] ||
+    die "recovery-ack requires --confirm-reviewed after inspecting status and recovery metadata"
+  [[ -f "$RECOVERY_META" ]] || die "no recovery metadata exists"
+  all_shut_off; assert_no_bitcoin_attachments
+  [[ ! -f "$CANONICAL" ]] || canonical_preflight
+  local operation result
+  operation="$(meta_get "$RECOVERY_META" operation)"
+  result="$(meta_get "$RECOVERY_META" result)"
+  case "$operation:$result" in
+    promotion:automatic-restore)
+      assert_no_process_reference "$CANONICAL_DIR/promotion-candidate.qcow2"
+      rm -f -- "$CANONICAL_DIR/promotion-candidate.qcow2" "$CANONICAL_DIR/promotion-manifest.env"
+      ;;
+    rollback:automatic-reverse) : ;;
+    bootstrap-promotion:source-preserved)
+      assert_no_process_reference "$BOOTSTRAP_CANDIDATE"
+      rm -f -- "$BOOTSTRAP_CANDIDATE" "$BOOTSTRAP_CANDIDATE_META"
+      [[ -f "$BOOTSTRAP" && -f "$BOOTSTRAP_VERIFY" ]] ||
+        die "bootstrap recovery source/evidence is missing; do not acknowledge automatically"
+      ;;
+    *) die "unrecognized recovery state '$operation:$result'; manual forensic review is required" ;;
+  esac
+  rm -f -- "$RECOVERY_META"
+  note "reviewed recovery metadata cleared; valuable canonical/bootstrap/overlay state was preserved"
+}
+
 adapter_status() {
-  local vm="${1:-}"
+  local vm="${1:-}" platform file
   [[ -z "$vm" ]] || valid_vm "$vm"
-  [[ -z "$vm" || "$vm" == ubuntu ]] && echo "ubuntu: module=guest/ubuntu-knots-rdts.sh knots=${KNOTS_VERSION:-UNCONFIGURED} rdts_profile=${KNOTS_RDTS_PROFILE:-UNCONFIGURED}"
-  [[ -z "$vm" || "$vm" == umbrel ]] && echo "umbrel: module=guest/umbrel-adapter.sh supported_release=${UMBREL_SUPPORTED_VERSION:-UNCONFIGURED}; run adapter verify inside guest"
-  [[ -z "$vm" || "$vm" == startos ]] && echo "startos: module=guest/startos-adapter.sh supported_release=${STARTOS_SUPPORTED_VERSION:-UNCONFIGURED}; run adapter verify inside guest"
+  [[ -z "$vm" || "$vm" == ubuntu ]] &&
+    echo "ubuntu: module=guest/ubuntu-knots-rdts.sh knots=${KNOTS_VERSION_NORMALIZED:-UNCONFIGURED} rdts_profile=${KNOTS_RDTS_PROFILE_NAME:-UNCONFIGURED}"
+  for platform in umbrel startos; do
+    [[ -z "$vm" || "$vm" == "$platform" ]] || continue
+    file="$ADAPTER_STATE_DIR/$platform.json"
+    if [[ -f "$file" ]] && jq -e '.last_validation_result == "ok"' "$file" >/dev/null 2>&1; then
+      jq -r '"\(.platform): os=\(.os_version) package=\(.package_version) profile=\(.profile_digest) adapter=\(.adapter_implementation_version) validated=\(.validated_at)"' "$file"
+    else
+      echo "$platform: UNVERIFIED (run adapter-setup and adapter-validate with an exact guest profile)"
+    fi
+  done
 }
 
 adapter_guest_action() {
@@ -612,10 +692,19 @@ adapter_guest_action() {
   [[ "$(owner_vm)" == "$vm" && ! "$(is_shut_off "$vm" && echo yes)" == yes ]] ||
     die "$vm must actively own the overlay"
   local script="/usr/local/libexec/bvml/${vm}-adapter.sh"
-  virshq qemu-agent-command "$(domain "$vm")" \
-    "{\"execute\":\"guest-exec\",\"arguments\":{\"path\":\"$script\",\"arg\":[\"$action\"],\"capture-output\":true}}" \
-    >/dev/null || die "$vm adapter $action request failed; inspect guest-agent output"
-  note "$vm adapter $action requested; run adapter-status/guest verify before claiming readiness"
+  guest_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" "$action"
+  [[ "$action" == verify ]] || guest_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" verify
+  guest_exec_sync "$vm" /bin/cat 30 /etc/bvml/adapter-verification.json
+  local tmp="$ADAPTER_STATE_DIR/$vm.json.new"
+  printf '%s\n' "$GUEST_EXEC_STDOUT" >"$tmp"
+  jq -e --arg platform "$vm" '
+    .platform == $platform and .last_validation_result == "ok" and
+    ([.os_version,.package_version,.profile_digest,.knots_binary_digest,
+      .adapter_implementation_version,.validated_at] | all(type == "string" and length > 0))
+  ' "$tmp" >/dev/null || { rm -f -- "$tmp"; die "$vm returned invalid adapter verification metadata"; }
+  chmod 0600 "$tmp"
+  mv -- "$tmp" "$ADAPTER_STATE_DIR/$vm.json"
+  note "$vm adapter $action completed and verified guest profile metadata was recorded"
 }
 
 validate_all() { exec "$ROOT/scripts/vm/validate.sh"; }
@@ -624,7 +713,7 @@ status_all() { exec "$ROOT/scripts/vm/status.sh"; }
 case "$command" in
   init) with_lock note "storage initialized at $BVML_STORAGE" ;;
   create) with_lock "$ROOT/scripts/vm/create.sh" "${1:?VM required}" ;;
-  start) with_lock start_vm "${1:?VM required}" ;;
+  start) with_lock start_vm "${1:?VM required}" "${2:-}" ;;
   stop) with_lock stop_vm "${1:?VM required}" ;;
   discard) with_lock discard_overlay "${1:-}" ;;
   reset) with_lock reset_vm "${1:?VM required}" ;;
@@ -642,6 +731,7 @@ case "$command" in
   checkpoint-protect) with_lock protect_image "$CANONICAL" ;;
   checkpoint-rollback) with_lock checkpoint_rollback ;;
   rollback-remove) with_lock rollback_remove "$@" ;;
+  recovery-ack) with_lock recovery_ack "$@" ;;
   adapter-setup) with_lock adapter_guest_action "${1:?VM required}" setup ;;
   adapter-validate) with_lock adapter_guest_action "${1:?VM required}" verify ;;
   adapter-status) adapter_status "${1:-}" ;;
