@@ -66,6 +66,8 @@ transactional_attach_start() {
       write_env_file "$meta" "kind=bootstrap" "bootstrap_id=$identity" \
         "vm=$vm" "created=$(date -u +%FT%TZ)" "size_gib=$BOOTSTRAP_SIZE_GIB" \
         "size_bytes=$size_bytes" "disk_serial=$serial" "bootstrap_nonce=$nonce" \
+        "profile_generation_id=$(profile_generation_id)" \
+        "profile_generation_digest=$(active_profile_generation_digest)" \
         "filesystem_initialized=0" "state=created"
       ;;
     *) die "unsupported transactional image kind: $kind" ;;
@@ -280,7 +282,24 @@ bootstrap_verify() {
   rm -f -- "$tmp"
   virt-cat -a "$BOOTSTRAP" -m /dev/sda /.bvml/ubuntu-verification.env >"$tmp" ||
     { rm -f -- "$tmp"; die "current bootstrap verification evidence is missing"; }
-  printf 'bootstrap_id=%s\n' "$(meta_get "$BOOTSTRAP_META" bootstrap_id)" >>"$tmp"
+  validate_profile_generation
+  local system_image release_guest rdts_guest checkpoint_guest
+  system_image="$(vm_dir ubuntu)/system.qcow2"
+  release_guest="$(virt-cat -a "$system_image" /etc/bvml/releases/knots-version.env | sha256sum | awk '{print $1}')"
+  rdts_guest="$(virt-cat -a "$system_image" /etc/bvml/releases/knots-rdts.env | sha256sum | awk '{print $1}')"
+  checkpoint_guest="$(virt-cat -a "$system_image" /etc/bvml/checkpoint-profile.json | sha256sum | awk '{print $1}')"
+  [[ "$release_guest" == "${KNOTS_RELEASE_PROFILE_SHA256,,}" &&
+     "$rdts_guest" == "${KNOTS_RDTS_PROFILE_SHA256,,}" &&
+     "$checkpoint_guest" == "${CHECKPOINT_PROFILE_SHA256,,}" ]] ||
+    { rm -f -- "$tmp"; die "stopped Ubuntu profile generation differs from the host-approved generation"; }
+  printf '%s\n' \
+    "bootstrap_id=$(meta_get "$BOOTSTRAP_META" bootstrap_id)" \
+    "release_profile_sha256=$release_guest" \
+    "profile_generation_id=$(profile_generation_id)" \
+    "profile_generation_digest=$(active_profile_generation_digest)" >>"$tmp"
+  [[ "$(meta_get "$BOOTSTRAP_META" profile_generation_id)" == "$(profile_generation_id)" ||
+     -z "$(meta_get "$BOOTSTRAP_META" profile_generation_id)" ]] ||
+    { rm -f -- "$tmp"; die "bootstrap manifest belongs to another profile generation"; }
   mv -- "$tmp" "$BOOTSTRAP_VERIFY"
   [[ "$(meta_get "$BOOTSTRAP_VERIFY" bootstrap_id)" == "$(meta_get "$BOOTSTRAP_META" bootstrap_id)" ]] ||
     die "verification belongs to another bootstrap image"
@@ -300,34 +319,92 @@ bootstrap_promote() {
   all_shut_off; assert_no_bitcoin_attachments; [[ ! -e "$OWNER_FILE" ]] || die "bootstrap owner remains"
   assert_no_process_reference "$BOOTSTRAP"
   verify_promotion_evidence "$BOOTSTRAP_VERIFY" bootstrap
-  need virt-customize; need qemu-img
-  rm -f -- "$BOOTSTRAP_CANDIDATE" "$BOOTSTRAP_CANDIDATE_META"
-  qemu-img convert -p -O qcow2 "$BOOTSTRAP" "$BOOTSTRAP_CANDIDATE" ||
-    die "bootstrap conversion failed; verified bootstrap and evidence are unchanged"
-  virt-customize -a "$BOOTSTRAP_CANDIDATE" --rm /.bvml/ubuntu-verification.env >/dev/null ||
-    { rm -f -- "$BOOTSTRAP_CANDIDATE"; die "candidate evidence cleanup failed; verified bootstrap is unchanged"; }
-  validate_checkpoint_image "$BOOTSTRAP_CANDIDATE" ||
-    { rm -f -- "$BOOTSTRAP_CANDIDATE"; die "bootstrap candidate validation failed; verified bootstrap is unchanged"; }
-  local generation id
-  id="$(sha256sum "$BOOTSTRAP_CANDIDATE" | awk '{print $1}')"; generation="$(new_id)"
-  validate_checkpoint_profile
-  write_env_file "$BOOTSTRAP_CANDIDATE_META" "id=$id" "generation=$generation" \
+  [[ "$ROLLBACK_RETENTION" == none ]] ||
+    die "first low-space promotion requires ROLLBACK_RETENTION=none"
+  need guestfish; need qemu-img; need sha256sum
+  validate_checkpoint_image "$BOOTSTRAP" ||
+    die "verified bootstrap image failed final checkpoint validation"
+  local generation id bundle raw_evidence info_file check_file domain_xml meta_tmp
+  generation="$(new_id)"
+  bundle="$RUN_DIR/recovery-bundles/$(meta_get "$BOOTSTRAP_META" bootstrap_id)-promotion"
+  raw_evidence="$bundle/guest-verification.env"
+  if [[ -d "$bundle" ]]; then
+    [[ -s "$raw_evidence" && -s "$bundle/host-verification.env" &&
+       "$(meta_get "$bundle/bootstrap-manifest.env" bootstrap_id)" == "$(meta_get "$BOOTSTRAP_META" bootstrap_id)" ]] ||
+      die "existing promotion recovery bundle is incomplete or belongs to another bootstrap: $bundle"
+  else
+    install -d -m 0700 "$bundle"
+    virt-cat -a "$BOOTSTRAP" -m /dev/sda /.bvml/ubuntu-verification.env >"$raw_evidence" ||
+      { rm -f -- "$bundle"/*; rmdir "$bundle"; die "could not preserve in-image verification evidence"; }
+    cp -- "$BOOTSTRAP_META" "$bundle/bootstrap-manifest.env"
+    cp -- "$BOOTSTRAP_VERIFY" "$bundle/host-verification.env"
+    cp -- "$KNOTS_RELEASE_PROFILE" "$bundle/knots-release-profile.env"
+    cp -- "$KNOTS_RDTS_PROFILE" "$bundle/knots-rdts-profile.env"
+    cp -- "$CHECKPOINT_PROFILE_FILE" "$bundle/checkpoint-profile.json"
+    domain_xml="$bundle/ubuntu-domain.xml"
+    virshq dumpxml "$(domain ubuntu)" --inactive >"$domain_xml"
+    info_file="$bundle/qemu-img-info.json"; check_file="$bundle/qemu-img-check.txt"
+    qemu-img info --output=json "$BOOTSTRAP" >"$info_file"
+    qemu-img check "$BOOTSTRAP" >"$check_file"
+    {
+      printf 'bootstrap_id=%s\n' "$(meta_get "$BOOTSTRAP_META" bootstrap_id)"
+      printf 'filesystem_uuid=%s\n' "$(meta_get "$BOOTSTRAP_VERIFY" filesystem_uuid)"
+      printf 'profile_generation_id=%s\n' "$(meta_get "$BOOTSTRAP_VERIFY" profile_generation_id)"
+      printf 'knots_binary_sha256=%s\n' "$(meta_get "$BOOTSTRAP_VERIFY" artifact_sha256)"
+      printf 'block_height=%s\n' "$(meta_get "$BOOTSTRAP_VERIFY" block_height)"
+      printf 'best_block_hash=%s\n' "$(meta_get "$BOOTSTRAP_VERIFY" best_block_hash)"
+      printf 'best_block_time=%s\n' "$(meta_get "$BOOTSTRAP_VERIFY" best_block_time)"
+    } >"$bundle/recovery-summary.env"
+    sha256sum "$bundle"/* >"$bundle/bundle.sha256"
+  fi
+  sync -f "$BOOTSTRAP"; sync -f "$ACTIVE_DIR"; sync -f "$bundle"
+
+  # The only blockchain-sized image is modified only to remove transient
+  # evidence, then renamed atomically on the same filesystem.
+  guestfish_data_disk "$BOOTSTRAP" rm /.bvml/ubuntu-verification.env >/dev/null ||
+    die "transient evidence cleanup failed; bootstrap path and host evidence remain intact"
+  sync -f "$BOOTSTRAP"; sync -f "$ACTIVE_DIR"
+  id="$(sha256sum "$BOOTSTRAP" | awk '{print $1}')"
+  printf '%s  %s\n' "$id" "$(basename "$CANONICAL")" >"$bundle/canonical-image.sha256"
+  meta_tmp="$CANONICAL_META.new"
+  write_env_file "$meta_tmp" "id=$id" "generation=$generation" \
     "created=$(date -u +%FT%TZ)" "network=main" "blocksxor=0" "layout=root-datadir" \
-    "kind=fresh-knots-rdts-ibd" "knots_version_normalized=$(meta_get "$BOOTSTRAP_VERIFY" knots_version_normalized)" \
+    "kind=fresh-knots-rdts-ibd" "rollback_retention=none" "disaster_recovery=re-IBD" \
+    "source_bootstrap_id=$(meta_get "$BOOTSTRAP_META" bootstrap_id)" \
+    "filesystem_uuid=$(meta_get "$BOOTSTRAP_VERIFY" filesystem_uuid)" \
+    "knots_version_normalized=$(meta_get "$BOOTSTRAP_VERIFY" knots_version_normalized)" \
+    "knots_artifact_sha256=$(meta_get "$BOOTSTRAP_VERIFY" artifact_sha256)" \
+    "release_profile_sha256=$(meta_get "$BOOTSTRAP_VERIFY" release_profile_sha256)" \
+    "rdts_profile_name=$(meta_get "$BOOTSTRAP_VERIFY" rdts_profile_name)" \
+    "rdts_profile_sha256=$(meta_get "$BOOTSTRAP_VERIFY" rdts_profile_sha256)" \
+    "rdts_observed_args_json=$(meta_get "$BOOTSTRAP_VERIFY" rdts_observed_args_json)" \
+    "profile_generation_id=$(meta_get "$BOOTSTRAP_VERIFY" profile_generation_id)" \
+    "profile_generation_digest=$(meta_get "$BOOTSTRAP_VERIFY" profile_generation_digest)" \
     "checkpoint_profile_id=$(checkpoint_profile_id)" \
-    "checkpoint_profile_sha256=${CHECKPOINT_PROFILE_SHA256,,}"
-  mv -- "$BOOTSTRAP_CANDIDATE" "$CANONICAL"
-  mv -- "$BOOTSTRAP_CANDIDATE_META" "$CANONICAL_META"
+    "checkpoint_profile_sha256=${CHECKPOINT_PROFILE_SHA256,,}" \
+    "block_height=$(meta_get "$BOOTSTRAP_VERIFY" block_height)" \
+    "header_height=$(meta_get "$BOOTSTRAP_VERIFY" header_height)" \
+    "best_block_hash=$(meta_get "$BOOTSTRAP_VERIFY" best_block_hash)" \
+    "best_block_time=$(meta_get "$BOOTSTRAP_VERIFY" best_block_time)" \
+    "median_time=$(meta_get "$BOOTSTRAP_VERIFY" median_time)" \
+    "verified_epoch=$(meta_get "$BOOTSTRAP_VERIFY" verified_epoch)" \
+    "index_state_json=$(meta_get "$BOOTSTRAP_VERIFY" index_state_json)"
+  mv -- "$BOOTSTRAP" "$CANONICAL"
+  mv -- "$meta_tmp" "$CANONICAL_META"
+  sync -f "$ACTIVE_DIR"; sync -f "$CANONICAL_DIR"
   if ! (protect_image "$CANONICAL" && canonical_preflight); then
     unprotect_image "$CANONICAL" || true
-    mv -- "$CANONICAL" "$BOOTSTRAP_CANDIDATE"
-    mv -- "$CANONICAL_META" "$BOOTSTRAP_CANDIDATE_META"
+    mv -- "$CANONICAL" "$BOOTSTRAP"
+    rm -f -- "$CANONICAL_META"
+    guestfish_data_disk "$BOOTSTRAP" upload "$raw_evidence" /.bvml/ubuntu-verification.env >/dev/null || true
+    sync -f "$BOOTSTRAP"; sync -f "$ACTIVE_DIR"
     write_env_file "$RECOVERY_META" "operation=bootstrap-promotion" "result=source-preserved" \
-      "bootstrap_id=$(meta_get "$BOOTSTRAP_META" bootstrap_id)"
-    die "bootstrap installation/protection failed; original verified bootstrap and evidence remain retryable"
+      "bootstrap_id=$(meta_get "$BOOTSTRAP_META" bootstrap_id)" "recovery_bundle=$bundle"
+    die "bootstrap installation/protection failed; bootstrap path and recovery evidence were restored"
   fi
-  rm -f -- "$BOOTSTRAP" "$BOOTSTRAP_META" "$BOOTSTRAP_VERIFY" "$RECOVERY_META"
-  note "fresh Knots/RDTS IBD installed as the first protected canonical checkpoint"
+  sync -f "$CANONICAL"; sync -f "$CANONICAL_DIR"
+  rm -f -- "$BOOTSTRAP_META" "$BOOTSTRAP_VERIFY" "$RECOVERY_META"
+  note "fresh Knots/RDTS IBD renamed in place as the first protected canonical checkpoint"
 }
 
 bootstrap_cleanup() {
@@ -498,6 +575,10 @@ verify_promotion_evidence() {
   else
     [[ "$(meta_get "$evidence" bootstrap_id)" == "$(meta_get "$BOOTSTRAP_META" bootstrap_id)" ]] ||
       die "verification belongs to another bootstrap"
+    [[ "$(meta_get "$evidence" release_profile_sha256)" == "${KNOTS_RELEASE_PROFILE_SHA256,,}" &&
+       "$(meta_get "$evidence" profile_generation_id)" == "$(profile_generation_id)" &&
+       "$(meta_get "$evidence" profile_generation_digest)" == "$(active_profile_generation_digest)" ]] ||
+      die "verification is not bound to the current host/guest profile generation"
   fi
 }
 
@@ -533,7 +614,7 @@ checkpoint_promote() {
   local candidate_meta="$CANONICAL_DIR/promotion-manifest.env" id
   rm -f -- "$candidate" "$candidate_meta"
   qemu-img convert -p -O qcow2 "$OVERLAY" "$candidate"
-  virt-customize -a "$candidate" --rm /.bvml/ubuntu-verification.env >/dev/null
+  virt_customize_offline -a "$candidate" --delete /.bvml/ubuntu-verification.env >/dev/null
   validate_checkpoint_image "$candidate" || { rm -f -- "$candidate"; die "promotion candidate validation failed"; }
   id="$(sha256sum "$candidate" | awk '{print $1}')"
   write_env_file "$candidate_meta" "id=$id" "created=$(date -u +%FT%TZ)" \

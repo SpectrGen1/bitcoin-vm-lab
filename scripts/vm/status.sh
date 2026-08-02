@@ -27,9 +27,14 @@ fi
   echo "import: candidate or partial import state present" || echo "import: absent"
 [[ -f "$BOOTSTRAP_CANDIDATE" || -f "$BOOTSTRAP_CANDIDATE_META" ]] &&
   echo "promotion-candidate: bootstrap candidate present" || echo "promotion-candidate: absent"
-[[ -f "$ROLLBACK" ]] &&
-  echo "rollback: available id=$(meta_get "$ROLLBACK_META" id) generation=$(meta_get "$ROLLBACK_META" generation)" ||
+if [[ "$ROLLBACK_RETENTION" == none ]]; then
+  echo "rollback: disabled by storage policy"
+  echo "disaster recovery: re-IBD"
+elif [[ -f "$ROLLBACK" ]]; then
+  echo "rollback: available id=$(meta_get "$ROLLBACK_META" id) generation=$(meta_get "$ROLLBACK_META" generation)"
+else
   echo "rollback: absent"
+fi
 
 if [[ -f "$OVERLAY" || -f "$OVERLAY_META" ]]; then
   [[ -f "$OWNER_FILE" ]] && label=active || label=retained

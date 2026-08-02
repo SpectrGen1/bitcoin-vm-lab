@@ -82,6 +82,14 @@ guest_exec_sync() {
     sleep 1
   done
 }
+virt_customize_offline() {
+  LIBGUESTFS_PATH="$LIBGUESTFS_APPLIANCE_PATH" LIBGUESTFS_BACKEND=direct \
+    virt-customize "$@"
+}
+guestfish_data_disk() {
+  LIBGUESTFS_PATH="$LIBGUESTFS_APPLIANCE_PATH" LIBGUESTFS_BACKEND=direct \
+    guestfish --rw -a "$1" -m /dev/sda "${@:2}"
+}
 is_defined() { virshq dominfo "$(domain "$1")" >/dev/null 2>&1; }
 domain_state() { virshq domstate "$(domain "$1")" 2>/dev/null | sed -n '1{s/[[:space:]]*$//;p;}'; }
 is_shut_off() { [[ "$(domain_state "$1")" == "shut off" ]]; }
@@ -97,6 +105,19 @@ owner_image() { meta_get "$OWNER_FILE" image; }
 canonical_id() { meta_get "$CANONICAL_META" id; }
 overlay_id() { meta_get "$OVERLAY_META" overlay_id; }
 checkpoint_generation() { meta_get "$CANONICAL_META" generation; }
+profile_generation_digest() {
+  printf '%s\n' \
+    "release=${KNOTS_RELEASE_PROFILE_SHA256,,}" \
+    "rdts=${KNOTS_RDTS_PROFILE_SHA256,,}" \
+    "checkpoint=${CHECKPOINT_PROFILE_SHA256,,}" |
+    sha256sum | awk '{print $1}'
+}
+profile_generation_id() {
+  printf '%s' "${PROFILE_GENERATION_ID:-$(profile_generation_digest)}"
+}
+active_profile_generation_digest() {
+  printf '%s' "${PROFILE_GENERATION_DIGEST:-$(profile_generation_digest)}"
+}
 new_id() {
   if command -v uuidgen >/dev/null; then uuidgen
   else printf '%s-%s-%s\n' "$(date +%s%N)" "$$" "$RANDOM" | sha256sum | cut -d' ' -f1
@@ -105,7 +126,7 @@ new_id() {
 
 validate_host_config_values() {
   local name value
-  for name in BVML_STORAGE BVML_MEDIA_DIR BVML_HOST_CONFIG_DIR CHECKPOINT_PROFILE_FILE; do
+  for name in BVML_STORAGE BVML_MEDIA_DIR BVML_HOST_CONFIG_DIR CHECKPOINT_PROFILE_FILE CHECKPOINT_PROFILE_SOURCE; do
     value="${!name:-}"
     [[ "$value" == /* && ! "$value" =~ [[:cntrl:]] && "$value" != *'"'* ]] ||
       die "$name must be an absolute path without quotes or control characters"
@@ -316,6 +337,17 @@ validate_checkpoint_profile() {
   checkpoint_profile_indexes_json >/dev/null || die "checkpoint profile indexes are invalid"
 }
 
+validate_profile_generation() {
+  [[ "$KNOTS_RELEASE_PROFILE_SHA256" =~ ^[0-9a-fA-F]{64}$ &&
+     "$KNOTS_RDTS_PROFILE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] ||
+    die "release and RDTS profile digests must be configured"
+  [[ "$(sha256sum "$KNOTS_RELEASE_PROFILE" | awk '{print $1}')" == "${KNOTS_RELEASE_PROFILE_SHA256,,}" ]] ||
+    die "Knots release profile digest mismatch"
+  [[ "$(sha256sum "$KNOTS_RDTS_PROFILE" | awk '{print $1}')" == "${KNOTS_RDTS_PROFILE_SHA256,,}" ]] ||
+    die "Knots RDTS profile digest mismatch"
+  validate_checkpoint_profile
+}
+
 qemu_can_read_image() {
   local image="$1"
   if [[ "${BVML_TESTING:-0}" == 1 ]]; then
@@ -325,6 +357,36 @@ qemu_can_read_image() {
   sudo -u "$QEMU_USER" test -x "$BVML_STORAGE" &&
     sudo -u "$QEMU_USER" test -x "$(dirname "$image")" &&
     sudo -u "$QEMU_USER" test -r "$image"
+}
+
+quarantine_media() {
+  local image="$1" rejected="${image}.rejected.$(date -u +%Y%m%dT%H%M%SZ)"
+  chmod u+w "$image" 2>/dev/null || true
+  mv -- "$image" "$rejected"
+  echo "$rejected"
+}
+
+validate_cloud_image() {
+  local image="$1" expected="$2" actual info reason=
+  [[ -f "$image" ]] || die "cloud image is missing: $image"
+  actual="$(sha256sum "$image" | awk '{print $1}')"
+  [[ "$actual" == "${expected,,}" ]] || reason="pinned SHA-256 mismatch"
+  if [[ -z "$reason" ]]; then
+    info="$(qemu-img info --output=json "$image" 2>/dev/null)" || reason="qemu-img info failed"
+  fi
+  if [[ -z "$reason" ]]; then
+    jq -e '.format == "qcow2" and ((.["backing-filename"] // "") == "")' \
+      <<<"$info" >/dev/null || reason="image is not standalone qcow2"
+  fi
+  if [[ -z "$reason" ]]; then
+    qemu-img check "$image" >/dev/null 2>&1 || reason="qemu-img check failed"
+  fi
+  if [[ -n "$reason" ]]; then
+    local rejected; rejected="$(quarantine_media "$image")"
+    die "$reason; quarantined staged image at $rejected"
+  fi
+  chmod 0444 "$image"
+  [[ "$(stat -c %a "$image")" == 444 ]] || die "could not make staged image read-only"
 }
 
 canonical_preflight() {
@@ -350,6 +412,16 @@ canonical_preflight() {
     die "canonical checkpoint profile does not match configured profile"
   [[ "$(meta_get "$CANONICAL_META" checkpoint_profile_sha256)" == "${CHECKPOINT_PROFILE_SHA256,,}" ]] ||
     die "canonical checkpoint profile digest does not match configured profile"
+  validate_profile_generation
+  [[ "$(meta_get "$CANONICAL_META" profile_generation_id)" == "$(profile_generation_id)" ]] ||
+    die "canonical checkpoint belongs to another profile generation"
+  if [[ -n "$(meta_get "$CANONICAL_META" profile_generation_digest)" ]]; then
+    [[ "$(meta_get "$CANONICAL_META" profile_generation_digest)" == "$(active_profile_generation_digest)" ]] ||
+      die "canonical profile generation digest does not match configured profiles"
+  fi
+  [[ "$(meta_get "$CANONICAL_META" release_profile_sha256)" == "${KNOTS_RELEASE_PROFILE_SHA256,,}" &&
+     "$(meta_get "$CANONICAL_META" rdts_profile_sha256)" == "${KNOTS_RDTS_PROFILE_SHA256,,}" ]] ||
+    die "canonical release/RDTS profile digests do not match configured profiles"
   [[ "$(stat -c %a "$CANONICAL")" == 440 ]] || die "canonical mode must be 0440"
   image_immutable "$CANONICAL" || die "canonical immutable protection is missing"
   qemu_can_read_image "$CANONICAL" || die "system QEMU cannot traverse/read the canonical image"
@@ -485,6 +557,9 @@ assert_lifecycle_invariants() {
 }
 
 image_filesystem_uuid() {
-  virt-filesystems -a "$1" --filesystems --uuid 2>/dev/null |
-    awk 'NR > 1 && $2 != "" {print $2; exit}'
+  virt-filesystems -a "$1" --filesystems --uuid --long 2>/dev/null |
+    awk '
+      NR == 1 { for (i = 1; i <= NF; i++) if ($i == "UUID") uuid_column = i; next }
+      uuid_column && $uuid_column != "" && $uuid_column != "-" { print $uuid_column; exit }
+    '
 }

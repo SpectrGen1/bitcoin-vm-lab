@@ -45,6 +45,10 @@ case "$cmd" in
       printf '{"return":{"pid":42}}\n'
     fi
     ;;
+  dumpxml)
+    vm="$(vm_from_domain "$1")"
+    printf '<domain><name>bvml-%s</name><devices/></domain>\n' "$vm"
+    ;;
   define)
     rm -f -- "$TEST_ROOT/undefined-ubuntu"
     printf 'define\n' >>"$TEST_ROOT/virsh.log"

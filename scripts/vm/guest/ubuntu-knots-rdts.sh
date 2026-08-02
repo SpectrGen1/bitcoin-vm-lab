@@ -278,7 +278,11 @@ EOF
   sudo systemctl enable bvml-knots.service
 }
 
-invalidate_evidence() { expected_mount; rm -f -- "$EVIDENCE"; }
+invalidate_evidence() {
+  expected_mount
+  sudo rm -f -- "$EVIDENCE"
+  [[ ! -e "$EVIDENCE" ]] || fail "could not invalidate stale verification evidence"
+}
 start_knots() {
   expected_mount; validate_rdts_supported; invalidate_evidence
   sudo systemctl start bvml-knots.service

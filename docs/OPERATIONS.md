@@ -17,15 +17,22 @@
    selected storage path, verifies system-QEMU traversal, and checks that free
    space can accommodate the configured bootstrap capacity.
 4. Run `media-fetch ubuntu`, `profiles-install`, and `create ubuntu`.
-   `media-fetch` refuses an unpinned artifact and validates its digest, qcow2
-   format, and image check. `profiles-install` accepts signed metadata and a
+   `media-fetch` refuses an unpinned artifact and always validates its digest,
+   standalone qcow2 structure, image check, and read-only staging for both
+   existing and downloaded files. Invalid files are quarantined and failed
+   `.part` downloads are removed. `profiles-install` accepts signed metadata and a
    trusted signer key from absolute local paths or HTTPS, requires the exact
    configured `VALIDSIG`, binds the archive to its authenticated digest, and
-   installs root-owned `/etc/bvml` profiles. `create ubuntu` performs offline
+   imports/fingerprints the key in a temporary keyring, and atomically switches
+   a complete root-owned `/etc/bvml/active` profile generation. `create ubuntu` performs offline
    cloud-image customization with the direct libguestfs appliance, injects the
    SSH public key, QEMU guest agent, guest bootstrap script, signed metadata,
    RDTS profile, checkpoint profile, and fail-closed mount configuration. It
-   defines `bvml-ubuntu` without booting it.
+   verifies the standalone output disk and required guest files, explicitly
+   adds the QGA Virtio channel, validates its XML, and defines `bvml-ubuntu`
+   without booting it. Package installation through
+   `virt-customize --network --install` remains online and is not fully
+   reproducible unless package snapshots and versions are pinned.
 5. Run `checkpoint-bootstrap`. This creates an empty qcow2, marks it
    `fresh-ibd-incomplete`, attaches it exclusively to Ubuntu, records ownership,
    and boots Ubuntu. It does not format the disk.
@@ -50,13 +57,14 @@
    times, calculated tip age, IBD state, structured required-index state,
    observed RDTS arguments/profile digest, filesystem UUID, and a new shutdown
    event, then stops Knots cleanly.
-9. Run `bootstrap-stop`, `bootstrap-verify`, and
+9. Set `ROLLBACK_RETENTION=none`, then run `bootstrap-stop`, `bootstrap-verify`, and
    `bootstrap-promote --confirm-synced-clean`. Promotion accepts only evidence
-   matching this bootstrap ID. It leaves the verified bootstrap unchanged,
-   flattens a standalone candidate, removes transient evidence only from the
-   candidate, validates and protects the installed canonical, and removes the
-   bootstrap/evidence only after success. A failed install remains retryable
-   without another IBD or evidence collection.
+   matching this bootstrap ID and exact host/guest profile generation. First
+   promotion saves a small recovery bundle, flushes metadata, removes transient
+   in-image evidence, computes the full image SHA-256, and atomically renames
+   the already-standalone bootstrap on the same filesystem. It never copies or
+   converts the blockchain. A protection/validation failure renames it back and
+   restores the saved evidence.
 
 Use `bootstrap-status` through `bvml status`. An interrupted inactive bootstrap
 can be removed with `bootstrap-cleanup`; attached or active state must be
@@ -64,12 +72,15 @@ cleanly stopped first.
 
 ### Provisioning safety and recovery
 
-Provisioning commands hold the lifecycle lock and refuse any owner record,
-Bitcoin attachment, or active domain. They therefore cannot update guest
-assets during IBD or ordinary testing. A failed media download leaves only a
-`.part` file, while a digest mismatch is retained as `.rejected`. A failed
+Provisioning commands hold the lifecycle lock. Profile mutation is refused
+while any bootstrap, canonical, overlay, verification, or recovery state
+exists. `guest-repair ubuntu --scripts-only` is the narrow repair path: it
+proves all installed profile digests and changes lifecycle code only. Failed
+downloads remove `.part` files; invalid media is quarantined. A failed
 cloud conversion/customization or domain definition retains the persistent VM
-disks for inspection and never creates or attaches Bitcoin storage.
+disks for inspection and never creates or attaches Bitcoin storage. After
+inspection, `create-cleanup VM --confirm-remove-partial` removes only known
+disks for an undefined VM.
 
 `guest-provision ubuntu` is for repairing an already-created Ubuntu guest. It
 requires Ubuntu to be exactly `running`, UmbrelOS and StartOS to be exactly
@@ -162,7 +173,9 @@ automatically restores and reprotects the previous canonical. The overlay is
 removed only after success.
 
 A full rollback consumes nearly another checkpoint allocation. Retention is
-configurable with `ROLLBACK_RETENTION`; an explicitly configured external
+disabled by default with `ROLLBACK_RETENTION=none`; status reports
+`rollback: disabled by storage policy` and `disaster recovery: re-IBD`.
+An explicitly configured external
 destination must have adequate space. Remove an obsolete rollback only with:
 
 ```bash
@@ -198,6 +211,23 @@ Missing or mismatched versions fail closed. Host-level guessed bind mounts are
 not accepted. These integrations are not operational until populated profiles
 and the actual package/container `verify` commands pass.
 
+## Opt-in real-host integration tests
+
+The default suite is mocked. Real-host stages are individually gated:
+
+```bash
+sudo touch /dedicated/lab/path/.bvml-dedicated-integration-lab
+BVML_INTEGRATION=1 \
+BVML_INTEGRATION_STORAGE=/dedicated/lab/path \
+./bin/bvml integration-test preflight
+```
+
+Available stages are `cloud`, `bootstrap-finalize`, `ubuntu-smoke`, `umbrel`,
+and `startos`. Bootstrap finalization additionally requires
+`BVML_CONFIRM_DESTRUCTIVE_INTEGRATION=1`. The suite refuses unmarked storage,
+checks canonical immutability/fingerprints around disposable adapter tests, and
+is never part of `bvml test`.
+
 ## Protection, recovery, space, and backups
 
 Canonical protection is applied in this order: ownership/group, mode, ACL,
@@ -221,6 +251,9 @@ and the recovery marker while preserving the known-good canonical, rollback,
 retained overlay, or verified bootstrap. Unrecognized recovery states remain
 fail-closed for forensic repair.
 
+The low-space promotion recovery bundle is evidence, not a cold backup. It
+protects against lifecycle mistakes, not physical disk failure or unrecoverable
+qcow2 corruption; without an external backup, recovery is a new IBD.
 Back up canonical and rollback images only while every VM is shut off and no
 Bitcoin disk is attached. Back up each persistent `vms/<name>` directory
 separately. A retained rollback can be blockchain-sized; capacity planning must

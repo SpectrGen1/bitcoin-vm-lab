@@ -16,14 +16,18 @@ case "$cmd" in
     printf 'backing=%s\nsize=%s\n' "$backing" "$size" >"$out"
     ;;
   info)
-    file="${@: -1}"; backing="$(sed -n 's/^backing=//p' "$file")"
-    if [[ -n "$backing" ]]; then printf '{"format":"qcow2","backing-filename":"%s"}\n' "$backing"; else echo '{"format":"qcow2"}'; fi
+    file="${@: -1}"; backing="$(sed -n 's/^backing=//p' "$file")"; size="$(sed -n 's/^size=//p' "$file" | tail -1)"
+    if [[ "$size" =~ ^[0-9]+G$ ]]; then bytes=$((${size%G} * 1073741824)); else bytes=0; fi
+    if [[ -n "$backing" ]]; then printf '{"format":"qcow2","virtual-size":%s,"backing-filename":"%s"}\n' "$bytes" "$backing"; else printf '{"format":"qcow2","virtual-size":%s}\n' "$bytes"; fi
     ;;
   check)
     [[ ! -e "$TEST_ROOT/fail-check" ]]
     [[ ! -e "$TEST_ROOT/fail-candidate-check" || "${@: -1}" != *promotion-candidate.qcow2 ]]
     if [[ -e "$TEST_ROOT/fail-post-install" && "${@: -1}" == *bitcoin-mainnet.qcow2 ]] &&
-       grep -q '^standalone-from=' "${@: -1}"; then exit 1; fi
+       { grep -q '^standalone-from=' "${@: -1}" ||
+         grep -q '^kind=fresh-knots-rdts-ibd$' "$TEST_ROOT/storage/canonical/manifest.env" 2>/dev/null; }; then
+      exit 1
+    fi
     if [[ -e "$TEST_ROOT/fail-rollback-install" && "${@: -1}" == *bitcoin-mainnet.qcow2 ]] &&
        grep -q '^rollback-image' "${@: -1}"; then exit 1; fi
     ;;
@@ -31,6 +35,8 @@ case "$cmd" in
     [[ ! -e "$TEST_ROOT/fail-convert" ]] || exit 1
     in="${@: -2:1}"; out="${@: -1}"; printf 'standalone-from=%s\n' "$(sha256sum "$in" | awk '{print $1}')" >"$out"
     ;;
-  resize) : ;;
+  resize)
+    file="$1"; size="$2"; printf 'size=%s\n' "$size" >>"$file"
+    ;;
   *) exit 2 ;;
 esac

@@ -12,28 +12,37 @@ is_defined "$vm" && die "$(domain "$vm") already exists"
 iso_var="${vm^^}_ISO"; sum_var="${vm^^}_ISO_SHA256"
 iso="${!iso_var:-}"; expected="${!sum_var:-}"
 
-vmdir="$(vm_dir "$vm")"; install -d -m 0750 "$vmdir"
+vmdir="$(vm_dir "$vm")"
+if [[ -d "$vmdir" ]] && find "$vmdir" -mindepth 1 -print -quit | grep -q .; then
+  die "partial VM disk state exists at $vmdir; inspect it or run 'bvml create-cleanup $vm --confirm-remove-partial'"
+fi
+install -d -m 0750 "$vmdir"
 command -v setfacl >/dev/null && setfacl -m "u:$QEMU_USER:--x" "$vmdir" || true
 if [[ "$vm" == ubuntu && "$UBUNTU_IMAGE_MODE" == cloud ]]; then
   [[ "$UBUNTU_CLOUD_IMAGE" = /* && -f "$UBUNTU_CLOUD_IMAGE" ]] ||
     die "run 'bvml media-fetch ubuntu' first"
   [[ "$UBUNTU_CLOUD_IMAGE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] ||
     die "configure UBUNTU_CLOUD_IMAGE_SHA256"
-  actual="$(sha256sum "$UBUNTU_CLOUD_IMAGE" | awk '{print $1}')"
-  [[ "${actual,,}" == "${UBUNTU_CLOUD_IMAGE_SHA256,,}" ]] ||
-    die "Ubuntu cloud image checksum mismatch"
+  validate_cloud_image "$UBUNTU_CLOUD_IMAGE" "$UBUNTU_CLOUD_IMAGE_SHA256"
   [[ "$UBUNTU_CLOUD_SSH_KEY" = /* && -f "$UBUNTU_CLOUD_SSH_KEY" ]] ||
     die "configure an absolute UBUNTU_CLOUD_SSH_KEY public-key path"
   [[ "$UBUNTU_CLOUD_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ &&
      ! "$UBUNTU_CLOUD_SSH_KEY" =~ [[:cntrl:]] ]] ||
     die "Ubuntu cloud user or SSH key path is unsafe"
-  for file in "$BVML_HOST_CONFIG_DIR"/releases/knots-version.env "$BVML_HOST_CONFIG_DIR"/releases/knots-rdts.env \
-    "$BVML_HOST_CONFIG_DIR"/releases/SHA256SUMS "$BVML_HOST_CONFIG_DIR"/releases/SHA256SUMS.asc \
-    "$BVML_HOST_CONFIG_DIR"/releases/signing-key.gpg "$BVML_HOST_CONFIG_DIR"/checkpoint-profile.json; do
+  profile_release_dir="$(dirname "$KNOTS_RELEASE_PROFILE")"
+  for file in "$KNOTS_RELEASE_PROFILE" "$KNOTS_RDTS_PROFILE" \
+    "$profile_release_dir/SHA256SUMS" "$profile_release_dir/SHA256SUMS.asc" \
+    "$profile_release_dir/trusted-signers.gpg" "$CHECKPOINT_PROFILE_FILE"; do
     [[ -f "$file" ]] || die "run 'bvml profiles-install' first; missing $file"
   done
   qemu-img convert -p -f qcow2 -O qcow2 "$UBUNTU_CLOUD_IMAGE" "$vmdir/system.qcow2"
   qemu-img resize "$vmdir/system.qcow2" "${VM_DISK_GIB}G"
+  qemu-img check "$vmdir/system.qcow2" >/dev/null
+  info="$(qemu-img info --output=json "$vmdir/system.qcow2")"
+  [[ "$(jq -r '.format' <<<"$info")" == qcow2 &&
+     -z "$(jq -r '.["backing-filename"] // empty' <<<"$info")" &&
+     "$(jq -r '.["virtual-size"]' <<<"$info")" == "$((VM_DISK_GIB * 1073741824))" ]] ||
+    die "converted Ubuntu system disk failed standalone format/size validation"
 else
   [[ -n "$iso" && "$iso" = /* && -f "$iso" ]] || die "set $iso_var to an existing absolute ISO path"
   [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die "set $sum_var to the ISO's 64-character SHA-256"
@@ -50,6 +59,7 @@ boot=()
 if [[ "$vm" == ubuntu && "$UBUNTU_IMAGE_MODE" == cloud ]]; then
   need virt-customize
   guest_conf="$(mktemp)"
+  trap 'rm -f -- "$guest_conf" "${domain_xml:-}"' RETURN
   printf '%s\n' \
     'BITCOIN_MOUNT=/srv/bitcoin' 'BITCOIN_DEVICE=/dev/vdc' \
     "BITCOIN_SERVICE_USER=$UBUNTU_CLOUD_USER" "BITCOIN_SERVICE_GROUP=$UBUNTU_CLOUD_USER" \
@@ -67,12 +77,13 @@ if [[ "$vm" == ubuntu && "$UBUNTU_IMAGE_MODE" == cloud ]]; then
     --ssh-inject "$UBUNTU_CLOUD_USER:file:$UBUNTU_CLOUD_SSH_KEY" \
     --copy-in "$BVML_ROOT/scripts/vm/guest/ubuntu-knots-rdts.sh:/usr/local/libexec/bvml" \
     --copy-in "$guest_conf:/etc/bvml" \
-    --copy-in "$BVML_HOST_CONFIG_DIR/releases/knots-version.env:/etc/bvml/releases" \
-    --copy-in "$BVML_HOST_CONFIG_DIR/releases/knots-rdts.env:/etc/bvml/releases" \
-    --copy-in "$BVML_HOST_CONFIG_DIR/releases/SHA256SUMS:/etc/bvml/releases" \
-    --copy-in "$BVML_HOST_CONFIG_DIR/releases/SHA256SUMS.asc:/etc/bvml/releases" \
-    --copy-in "$BVML_HOST_CONFIG_DIR/releases/signing-key.gpg:/etc/bvml/releases" \
-    --copy-in "$BVML_HOST_CONFIG_DIR/checkpoint-profile.json:/etc/bvml" \
+    --copy-in "$KNOTS_RELEASE_PROFILE:/etc/bvml/releases" \
+    --copy-in "$KNOTS_RDTS_PROFILE:/etc/bvml/releases" \
+    --copy-in "$profile_release_dir/SHA256SUMS:/etc/bvml/releases" \
+    --copy-in "$profile_release_dir/SHA256SUMS.asc:/etc/bvml/releases" \
+    --copy-in "$profile_release_dir/trusted-signers.gpg:/etc/bvml/releases" \
+    --copy-in "$CHECKPOINT_PROFILE_FILE:/etc/bvml" \
+    --run-command "mv /etc/bvml/$(basename "$CHECKPOINT_PROFILE_FILE") /etc/bvml/checkpoint-profile.json" \
     --run-command "mv /etc/bvml/$(basename "$guest_conf") /etc/bvml/knots.env" \
     --run-command 'chmod 0755 /usr/local/libexec/bvml/ubuntu-knots-rdts.sh' \
     --run-command 'chown -R root:root /etc/bvml /usr/local/libexec/bvml' \
@@ -85,10 +96,21 @@ if [[ "$vm" == ubuntu && "$UBUNTU_IMAGE_MODE" == cloud ]]; then
       --virt-type kvm --os-variant ubuntu24.04 "${boot[@]}" \
       --disk "path=$vmdir/system.qcow2,format=qcow2,bus=virtio" \
       --disk "path=$vmdir/application.qcow2,format=qcow2,bus=virtio" \
-      --network "network=$BVML_NETWORK,model=virtio" \
+    --network "network=$BVML_NETWORK,model=virtio" \
+      --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0 \
       --graphics spice --video virtio --import --noautoconsole --print-xml >"$domain_xml"; then
     die "unattended Ubuntu XML generation failed; persistent disks were retained at $vmdir"
   fi
+  xmllint --noout "$domain_xml" || die "generated unattended Ubuntu domain XML is invalid"
+  xmllint --xpath 'boolean(/domain/devices/channel[@type="unix"]/target[@type="virtio" and @name="org.qemu.guest_agent.0"])' \
+    "$domain_xml" | grep -qx true || die "generated domain XML lacks the QGA Virtio channel"
+  for required in /etc/bvml/knots.env /etc/bvml/checkpoint-profile.json \
+    /usr/local/libexec/bvml/ubuntu-knots-rdts.sh; do
+    virt-cat -a "$vmdir/system.qcow2" "$required" >/dev/null ||
+      die "offline customization did not install required guest file: $required"
+  done
+  qemu-img check "$vmdir/system.qcow2" >/dev/null ||
+    die "customized Ubuntu system disk failed qemu-img check"
   if ! virshq define "$domain_xml" >/dev/null; then
     die "unattended Ubuntu definition failed; persistent disks were retained at $vmdir"
   fi

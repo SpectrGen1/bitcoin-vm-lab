@@ -32,7 +32,8 @@ setup_case() {
   cp "$ROOT/tests/support/fake-qemu-img" "$TEST_ROOT/bin/qemu-img"
   printf '#!/bin/sh\nprintf "blocks\\nchainstate\\nindexes\\n"\n' >"$TEST_ROOT/bin/virt-ls"
   printf '#!/bin/sh\n[[ ! -e "$TEST_ROOT/fail-virt-customize" ]]\n' >"$TEST_ROOT/bin/virt-customize"
-  printf '#!/bin/sh\ncase "$*" in *ubuntu-verification.env*) [[ -f "$TEST_ROOT/guest-evidence" ]] && cat "$TEST_ROOT/guest-evidence" || exit 1;; *) exit 0;; esac\n' >"$TEST_ROOT/bin/virt-cat"
+  printf '#!/bin/sh\n[[ ! -e "$TEST_ROOT/fail-guestfish" ]]\n' >"$TEST_ROOT/bin/guestfish"
+  printf '#!/bin/sh\ncase "$*" in *ubuntu-verification.env*) [[ -f "$TEST_ROOT/guest-evidence" ]] && cat "$TEST_ROOT/guest-evidence" || exit 1;; *knots-version.env*) cat "$TEST_ROOT/release.env";; *knots-rdts.env*) cat "$TEST_ROOT/rdts.env";; *checkpoint-profile.json*) cat "$CHECKPOINT_PROFILE_FILE";; *) exit 0;; esac\n' >"$TEST_ROOT/bin/virt-cat"
   printf '#!/bin/sh\nprintf "Name UUID\\n/dev/sda fs1\\n"\n' >"$TEST_ROOT/bin/virt-filesystems"
   printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nsize=; out="${@: -1}"\nwhile (($#)); do case "$1" in --size) size="$2"; shift 2;; --size=*) size="${1#--size=}"; shift;; *) shift;; esac; done\n[[ "$size" =~ ^[0-9]+$ ]] || exit 9\ndd of=/dev/null status=none\nprintf "backing=\\nimport_size=%s\\n" "$size" >"$out"\n' >"$TEST_ROOT/bin/virt-make-fs"
   chmod +x "$TEST_ROOT/bin"/*
@@ -42,8 +43,9 @@ teardown_case() { chmod -R u+w "$TEST_ROOT" 2>/dev/null || true; rm -rf -- "$TES
 make_canonical() {
   printf 'backing=\ncanonical\n' >"$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2"
   chmod 0440 "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2"
-  printf 'id=base-id\ngeneration=base-generation\nblocksxor=0\nnetwork=main\nlayout=root-datadir\ncheckpoint_profile_id=mainnet-no-indexes-v1\ncheckpoint_profile_sha256=%s\n' \
-    "$CHECKPOINT_PROFILE_SHA256" \
+  printf 'id=base-id\ngeneration=base-generation\nblocksxor=0\nnetwork=main\nlayout=root-datadir\ncheckpoint_profile_id=mainnet-no-indexes-v1\ncheckpoint_profile_sha256=%s\nrelease_profile_sha256=%s\nrdts_profile_sha256=%s\nprofile_generation_id=%s\n' \
+    "$CHECKPOINT_PROFILE_SHA256" "$KNOTS_RELEASE_PROFILE_SHA256" "$KNOTS_RDTS_PROFILE_SHA256" \
+    "$(printf '%s\n' "release=${KNOTS_RELEASE_PROFILE_SHA256,,}" "rdts=${KNOTS_RDTS_PROFILE_SHA256,,}" "checkpoint=${CHECKPOINT_PROFILE_SHA256,,}" | sha256sum | awk '{print $1}')" \
     >"$BVML_STORAGE/canonical/manifest.env"
   assert_file "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2"
 }
@@ -109,7 +111,7 @@ t_promote_attached() { setup_case; trap teardown_case EXIT; make_canonical; make
 t_conversion_preserves() { setup_case; trap teardown_case EXIT; make_canonical; make_stopped_overlay; write_verify; old="$(sha256sum "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2")"; touch "$TEST_ROOT/fail-convert"; expect_fail bvml checkpoint-promote --confirm-synced-clean; assert_eq "$(sha256sum "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2")" "$old"; }
 t_candidate_preserves() { setup_case; trap teardown_case EXIT; make_canonical; make_stopped_overlay; write_verify; old="$(sha256sum "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2")"; touch "$TEST_ROOT/fail-virt-customize"; expect_fail bvml checkpoint-promote --confirm-synced-clean; assert_eq "$(sha256sum "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2")" "$old"; }
 t_post_install_restores() { setup_case; trap teardown_case EXIT; make_canonical; make_stopped_overlay; write_verify; old="$(sha256sum "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2")"; touch "$TEST_ROOT/fail-post-install"; expect_fail bvml checkpoint-promote --confirm-synced-clean; assert_eq "$(sha256sum "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2")" "$old"; assert_file "$BVML_STORAGE/run/recovery.env"; }
-t_promote_success() { setup_case; trap teardown_case EXIT; make_canonical; make_stopped_overlay; write_verify; bvml checkpoint-promote --confirm-synced-clean >/dev/null; assert_file "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2"; assert_file "$BVML_STORAGE/canonical/bitcoin-mainnet.rollback.qcow2"; assert_absent "$BVML_STORAGE/active/bitcoin-mainnet-overlay.qcow2"; [[ ! -w "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2" ]]; }
+t_promote_success() { setup_case; trap teardown_case EXIT; make_canonical; make_stopped_overlay; write_verify; bvml checkpoint-promote --confirm-synced-clean >/dev/null; assert_file "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2"; assert_absent "$BVML_STORAGE/canonical/bitcoin-mainnet.rollback.qcow2"; assert_absent "$BVML_STORAGE/active/bitcoin-mainnet-overlay.qcow2"; [[ ! -w "$BVML_STORAGE/canonical/bitcoin-mainnet.qcow2" ]]; }
 t_bootstrap_no_source() { setup_case; trap teardown_case EXIT; bvml checkpoint-bootstrap >/dev/null; assert_file "$BVML_STORAGE/active/bitcoin-mainnet-bootstrap.qcow2"; assert_contains "$BVML_STORAGE/active/bootstrap-manifest.env" 'filesystem_initialized=0'; assert_file "$TEST_ROOT/attach-ubuntu"; }
 t_bootstrap_format_explicit() { setup_case; trap teardown_case EXIT; bvml checkpoint-bootstrap >/dev/null; expect_fail bvml bootstrap-init; bvml bootstrap-init --confirm-bootstrap-format >/dev/null; assert_contains "$BVML_STORAGE/active/bootstrap-manifest.env" 'filesystem_initialized=1'; }
 t_bootstrap_refuse_canonical() { setup_case; trap teardown_case EXIT; make_canonical; expect_fail bvml checkpoint-bootstrap; }
@@ -170,6 +172,39 @@ t_media_existing() {
   assert_file "$UBUNTU_CLOUD_IMAGE"
   assert_eq "$(stat -c %a "$UBUNTU_CLOUD_IMAGE")" 444
 }
+t_media_structural_quarantine() {
+  setup_case; trap teardown_case EXIT
+  export UBUNTU_IMAGE_MODE=cloud BVML_MEDIA_DIR="$TEST_ROOT/media"
+  export UBUNTU_CLOUD_IMAGE="$TEST_ROOT/media/ubuntu.qcow2"
+  export UBUNTU_CLOUD_IMAGE_URL=https://example.invalid/ubuntu.qcow2
+  mkdir -p "$BVML_MEDIA_DIR"
+  printf 'backing=/unexpected\ncloud-image\n' >"$UBUNTU_CLOUD_IMAGE"
+  export UBUNTU_CLOUD_IMAGE_SHA256
+  UBUNTU_CLOUD_IMAGE_SHA256="$(sha256sum "$UBUNTU_CLOUD_IMAGE" | awk '{print $1}')"
+  expect_fail bvml media-fetch ubuntu
+  assert_absent "$UBUNTU_CLOUD_IMAGE"
+  find "$BVML_MEDIA_DIR" -maxdepth 1 -name 'ubuntu.qcow2.rejected.*' -type f | grep -q .
+}
+t_profile_mutation_refuses_checkpoint() {
+  setup_case; trap teardown_case EXIT
+  make_canonical
+  expect_fail bvml profiles-install
+  assert_contains "$TEST_ROOT/bvml-expected-failure.out" 'profile replacement is blocked'
+}
+t_create_partial_refuses() {
+  setup_case; trap teardown_case EXIT
+  touch "$TEST_ROOT/undefined-ubuntu"
+  mkdir -p "$BVML_STORAGE/vms/ubuntu"
+  printf partial >"$BVML_STORAGE/vms/ubuntu/system.qcow2"
+  expect_fail bvml create ubuntu
+  assert_contains "$TEST_ROOT/bvml-expected-failure.out" 'partial VM disk state exists'
+  assert_file "$BVML_STORAGE/vms/ubuntu/system.qcow2"
+}
+t_guest_repair_contract() {
+  assert_contains "$ROOT/scripts/provision.sh" 'guest_repair_scripts'
+  assert_contains "$ROOT/scripts/provision.sh" 'guest profile digests are unchanged'
+  assert_contains "$ROOT/scripts/vm/guest/ubuntu-knots-rdts.sh" 'sudo rm -f -- "$EVIDENCE"'
+}
 t_cloud_create_contract() {
   local file="$ROOT/scripts/vm/create.sh"
   assert_contains "$file" 'UBUNTU_IMAGE_MODE'
@@ -205,12 +240,14 @@ t_profile_install_success() {
   printf '%s  %s\n' "$KNOTS_ARTIFACT_SHA256" "$KNOTS_ARCHIVE_NAME" >"$KNOTS_SHA256SUMS_SOURCE"
   printf signature >"$KNOTS_SHA256SUMS_ASC_SOURCE"
   printf key >"$KNOTS_SIGNING_KEY_SOURCE"
+  printf '#!/bin/sh\ncase "$*" in *--import*) exit 0;; *--with-colons*--fingerprint*) printf "fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:\\n";; *--export*) printf normalized-key;; *) exit 0;; esac\n' >"$TEST_ROOT/bin/gpg"
   printf '#!/bin/sh\nprintf "[GNUPG:] VALIDSIG AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 2026-01-01 0 0 0 0 0 0 0 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\\n"\n' >"$TEST_ROOT/bin/gpgv"
-  chmod +x "$TEST_ROOT/bin/gpgv"
+  chmod +x "$TEST_ROOT/bin/gpg" "$TEST_ROOT/bin/gpgv"
   bvml profiles-install >/dev/null
   assert_file "$BVML_HOST_CONFIG_DIR/host.env"
-  assert_file "$BVML_HOST_CONFIG_DIR/releases/knots-version.env"
-  assert_contains "$BVML_HOST_CONFIG_DIR/releases/knots-rdts.env" 'RDTS_REQUIRED_ARGS_JSON='
+  assert_file "$BVML_HOST_CONFIG_DIR/active/releases/knots-version.env"
+  assert_contains "$BVML_HOST_CONFIG_DIR/active/releases/knots-rdts.env" 'RDTS_REQUIRED_ARGS_JSON='
+  assert_file "$BVML_HOST_CONFIG_DIR/active/generation.json"
   assert_contains "$BVML_HOST_CONFIG_DIR/host.env" 'KNOTS_RELEASE_PROFILE_SHA256='
 }
 t_cloud_create_success() {
@@ -224,14 +261,17 @@ t_cloud_create_success() {
   UBUNTU_CLOUD_IMAGE_SHA256="$(sha256sum "$UBUNTU_CLOUD_IMAGE" | awk '{print $1}')"
   printf ssh-key >"$UBUNTU_CLOUD_SSH_KEY"
   mkdir -p "$BVML_HOST_CONFIG_DIR/releases"
-  for file in knots-version.env knots-rdts.env SHA256SUMS SHA256SUMS.asc signing-key.gpg; do
+  for file in knots-version.env knots-rdts.env SHA256SUMS SHA256SUMS.asc trusted-signers.gpg; do
     printf data >"$BVML_HOST_CONFIG_DIR/releases/$file"
   done
+  export KNOTS_RELEASE_PROFILE="$BVML_HOST_CONFIG_DIR/releases/knots-version.env"
+  export KNOTS_RDTS_PROFILE="$BVML_HOST_CONFIG_DIR/releases/knots-rdts.env"
+  export CHECKPOINT_PROFILE_FILE="$BVML_HOST_CONFIG_DIR/checkpoint-profile.json"
   cp "$ROOT/config/checkpoint-profile-none.json" "$BVML_HOST_CONFIG_DIR/checkpoint-profile.json"
   touch "$TEST_ROOT/undefined-ubuntu"
   printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nif [[ "${1:-}" == -E ]]; then shift; [[ "${1:-}" == env ]] && shift; while [[ "${1:-}" == *=* ]]; do shift; done; exec "$@"; fi\n[[ "${1:-}" == chown ]] && exit 0\nexec "$@"\n' >"$TEST_ROOT/bin/sudo"
   printf '#!/bin/sh\nprintf "%%s\\n" "$*" >"$TEST_ROOT/virt-customize.log"\n' >"$TEST_ROOT/bin/virt-customize"
-  printf '#!/bin/sh\nprintf "<domain type=\\"kvm\\"><name>bvml-ubuntu</name></domain>\\n"\n' >"$TEST_ROOT/bin/virt-install"
+  printf '#!/bin/sh\nprintf "<domain type=\\"kvm\\"><name>bvml-ubuntu</name><devices><channel type=\\"unix\\"><target type=\\"virtio\\" name=\\"org.qemu.guest_agent.0\\"/></channel></devices></domain>\\n"\n' >"$TEST_ROOT/bin/virt-install"
   chmod +x "$TEST_ROOT/bin/sudo" "$TEST_ROOT/bin/virt-customize" "$TEST_ROOT/bin/virt-install"
   bvml create ubuntu >/dev/null
   assert_file "$BVML_STORAGE/vms/ubuntu/system.qcow2"
@@ -258,8 +298,9 @@ tests=(parallel nonoff failed_attach failed_owner failed_start detach_preserves 
   container_proc_inside live_rdts_validation container_runtime_args guest_exec_waits guest_exec_request_json guest_exec_failure_output old_tip_rejected required_index_missing
   status_attachment_exact canonical_missing_generation canonical_missing_immutable canonical_wrong_profile
   overlay_generation_mismatch adapter_profile_metadata no_deleted_source provisioning_active_guard
-  media_existing cloud_create_contract profile_install_contract profile_install_success
-  cloud_create_success)
+  media_existing media_structural_quarantine cloud_create_contract profile_install_contract
+  profile_mutation_refuses_checkpoint profile_install_success create_partial_refuses
+  guest_repair_contract cloud_create_success)
 passed=0 failed=0
 for test_name in "${tests[@]}"; do
   "$BASH" "$0" --case "$test_name"

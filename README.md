@@ -10,7 +10,7 @@ the repository:
 
 ```text
 canonical/bitcoin-mainnet.qcow2          protected checkpoint
-canonical/bitcoin-mainnet.rollback.qcow2 optional full-size rollback
+canonical/bitcoin-mainnet.rollback.qcow2 optional full-size rollback (disabled by default)
 active/bitcoin-mainnet-bootstrap.qcow2   incomplete first-IBD image, when used
 active/bitcoin-mainnet-overlay.qcow2     only disposable test/update overlay
 run/owner.env                            active attachment transaction
@@ -32,10 +32,13 @@ sudo ./bin/bvml host-setup
 ```
 
 With `UBUNTU_IMAGE_MODE=cloud`, these commands replace the formerly manual
-Ubuntu bridge. `media-fetch` requires an HTTPS URL plus a pinned SHA-256 and
-validates qcow2 structure. `profiles-install` verifies the exact configured
+Ubuntu bridge. `media-fetch` applies the same pinned SHA-256, standalone-qcow2,
+`qemu-img check`, and read-only validation to existing and downloaded images;
+invalid pinned files are quarantined and failed `.part` downloads are removed.
+`profiles-install` verifies the exact configured
 signer over Knots' signed checksum metadata, proves that metadata binds the
-selected archive digest, and installs root-owned release/RDTS profiles.
+selected archive digest, normalizes the trusted keyring, and atomically installs
+a complete root-owned, generation-bound release/RDTS/checkpoint profile set.
 `storage-prepare` creates the configured storage hierarchy, grants only
 traversal where system QEMU needs it, verifies access, and checks bootstrap
 capacity. `create ubuntu` then clones the cloud image, provisions QEMU guest
@@ -48,6 +51,9 @@ to run while an owner record, Bitcoin attachment, or active VM exists.
 `guest-provision ubuntu` is an explicit QGA-based repair/update path for a
 running Ubuntu guest only when no Bitcoin lifecycle exists; it waits for the
 guest command and propagates failures.
+`guest-repair ubuntu --scripts-only` updates lifecycle code only after proving
+all guest profile digests are unchanged. Profile replacement is refused once
+bootstrap, canonical, overlay, verification, or recovery state exists.
 
 The bootstrap disk remains explicitly marked incomplete until authenticated
 Knots, the operator-approved digest-pinned release-specific RDTS profile,
