@@ -52,7 +52,7 @@ load_conf() {
 }
 
 normalize_version() {
-  sed -n '1{s/^Bitcoin Knots version[[:space:]]*//;s/[[:space:]]//g;p;}'
+  sed -En '1{s/^Bitcoin Knots (daemon )?version[[:space:]]+v?//;s/[[:space:]]//g;p;}'
 }
 
 load_profiles() {
@@ -107,7 +107,7 @@ stage_bootstrap() {
   load_conf
   (($# == 4)) || fail "stage-bootstrap requires ID, serial, size, and nonce"
   local id="$1" serial="$2" size="$3" nonce="$4"
-  [[ "$id" =~ ^[A-Za-z0-9-]{16,128}$ && "$serial" =~ ^BVMLB-[A-Za-z0-9]{8,16}$ &&
+  [[ "$id" =~ ^[A-Za-z0-9-]{16,128}$ && "$serial" =~ ^BVMLB-[A-Za-z0-9-]{8,16}$ &&
      "$size" =~ ^[1-9][0-9]*$ && "$nonce" =~ ^[A-Za-z0-9-]{16,128}$ ]] ||
     fail "bootstrap initialization metadata is malformed"
   sudo install -d -o root -g root -m 0700 "$(dirname "$BOOTSTRAP_STAGE")"
@@ -167,9 +167,13 @@ init_filesystem() {
 install_knots() {
   load_profiles
   local work status binary cli actual digest normalized
-  work="$(mktemp -d)"; trap 'rm -rf -- "$work"' RETURN
+  work="$(mktemp -d)"
   gpg --batch --no-default-keyring --keyring "$work/release.gpg" --import "$KNOTS_SIGNING_KEY" >/dev/null
-  status="$(gpgv --status-fd 1 --keyring "$work/release.gpg" "$KNOTS_SHA256SUMS_ASC" "$KNOTS_SHA256SUMS" 2>/dev/null)"
+  # Release signature files are multisigned. gpgv can return nonzero when the
+  # deliberately minimal keyring lacks unrelated signers, even though the
+  # operator-pinned signer validated. Trust only the exact required VALIDSIG.
+  status="$(gpgv --status-fd 1 --keyring "$work/release.gpg" \
+    "$KNOTS_SHA256SUMS_ASC" "$KNOTS_SHA256SUMS" 2>/dev/null || true)"
   grep -q "VALIDSIG $KNOTS_SIGNER_FINGERPRINT " <<<"$status" || fail "authenticated metadata signer mismatch"
   curl -fL "$KNOTS_RELEASE_BASE_URL/$KNOTS_ARCHIVE_NAME" -o "$work/$KNOTS_ARCHIVE_NAME"
   digest="$(sha256sum "$work/$KNOTS_ARCHIVE_NAME" | awk '{print $1}')"
@@ -189,6 +193,7 @@ install_knots() {
   printf '%s\n' "$digest" | sudo tee /etc/bvml/knots-artifact.sha256 >/dev/null
   printf '%s\n' "$actual" | sudo tee /etc/bvml/knots-actual-version >/dev/null
   printf '%s\n' "$normalized" | sudo tee /etc/bvml/knots-version-normalized >/dev/null
+  rm -rf -- "$work"
 }
 
 validate_rdts_supported() {

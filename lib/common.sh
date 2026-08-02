@@ -3,7 +3,9 @@ set -Eeuo pipefail
 
 BVML_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$BVML_ROOT/config/defaults.env"
-[[ -f "$BVML_ROOT/config/local.env" ]] && source "$BVML_ROOT/config/local.env"
+if [[ "${BVML_TESTING:-0}" != 1 && -f "$BVML_ROOT/config/local.env" ]]; then
+  source "$BVML_ROOT/config/local.env"
+fi
 
 CANONICAL_DIR="$BVML_STORAGE/canonical"
 CANONICAL="$CANONICAL_DIR/bitcoin-mainnet.qcow2"
