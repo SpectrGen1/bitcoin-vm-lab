@@ -3,15 +3,29 @@
 ## Initial setup and fresh checkpoint
 
 1. Copy `config/local.env.example` to `config/local.env`.
-2. Configure all three ISO paths and SHA-256 digests. Configure a pinned Knots
+2. For unattended Ubuntu, set `UBUNTU_IMAGE_MODE=cloud`, an absolute media
+   destination, an HTTPS cloud-image URL, its pinned SHA-256, the Ubuntu cloud
+   user, and an absolute SSH public-key path. Configure UmbrelOS and StartOS
+   ISO paths and SHA-256 digests separately. Configure a pinned Knots
    archive, authenticated signed checksum metadata, signer fingerprint, actual
    artifact digest, normalized version, and an operator-approved RDTS profile
    name plus its digest. Configure a digest-pinned JSON checkpoint/index
    profile and maximum acceptable best-block age.
-3. Run `host-setup`, `host-validate`, and `init`. Host setup installs only the
+3. Run `host-setup`, `host-validate`, and `storage-prepare`. Host setup installs only the
    needed Gentoo QEMU/libvirt, libguestfs, ACL, and selected EDK2/OVMF
-   prerequisites and enables libvirtd.
-4. Run `create ubuntu`. ISO verification is mandatory before VM creation.
+   prerequisites and enables libvirtd. `storage-prepare` configures only the
+   selected storage path, verifies system-QEMU traversal, and checks that free
+   space can accommodate the configured bootstrap capacity.
+4. Run `media-fetch ubuntu`, `profiles-install`, and `create ubuntu`.
+   `media-fetch` refuses an unpinned artifact and validates its digest, qcow2
+   format, and image check. `profiles-install` accepts signed metadata and a
+   trusted signer key from absolute local paths or HTTPS, requires the exact
+   configured `VALIDSIG`, binds the archive to its authenticated digest, and
+   installs root-owned `/etc/bvml` profiles. `create ubuntu` performs offline
+   cloud-image customization with the direct libguestfs appliance, injects the
+   SSH public key, QEMU guest agent, guest bootstrap script, signed metadata,
+   RDTS profile, checkpoint profile, and fail-closed mount configuration. It
+   defines `bvml-ubuntu` without booting it.
 5. Run `checkpoint-bootstrap`. This creates an empty qcow2, marks it
    `fresh-ibd-incomplete`, attaches it exclusively to Ubuntu, records ownership,
    and boots Ubuntu. It does not format the disk.
@@ -47,6 +61,22 @@
 Use `bootstrap-status` through `bvml status`. An interrupted inactive bootstrap
 can be removed with `bootstrap-cleanup`; attached or active state must be
 cleanly stopped first.
+
+### Provisioning safety and recovery
+
+Provisioning commands hold the lifecycle lock and refuse any owner record,
+Bitcoin attachment, or active domain. They therefore cannot update guest
+assets during IBD or ordinary testing. A failed media download leaves only a
+`.part` file, while a digest mismatch is retained as `.rejected`. A failed
+cloud conversion/customization or domain definition retains the persistent VM
+disks for inspection and never creates or attaches Bitcoin storage.
+
+`guest-provision ubuntu` is for repairing an already-created Ubuntu guest. It
+requires Ubuntu to be exactly `running`, UmbrelOS and StartOS to be exactly
+`shut off`, and no owner or Bitcoin attachment. It uses synchronous QEMU
+guest-agent execution, installs the same verified assets, and reports the
+guest command's real exit status. It is intentionally unavailable once
+`checkpoint-bootstrap` or an overlay lifecycle has begun.
 
 ## Optional compatible import
 

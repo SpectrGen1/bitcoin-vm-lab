@@ -82,6 +82,21 @@ validate_checkpoint_profile >/dev/null 2>&1 && ok "checkpoint index profile dige
   bad "checkpoint index profile is missing, malformed, or has the wrong digest"
 [[ "$MAX_TIP_AGE_SECONDS" =~ ^[1-9][0-9]*$ ]] || bad "MAX_TIP_AGE_SECONDS must be a positive integer"
 for vm in ubuntu umbrel startos; do
+  if [[ "$vm" == ubuntu && "$UBUNTU_IMAGE_MODE" == cloud ]]; then
+    if [[ -f "$UBUNTU_CLOUD_IMAGE" && "$UBUNTU_CLOUD_IMAGE_SHA256" =~ ^[0-9a-fA-F]{64}$ &&
+          "$(sha256sum "$UBUNTU_CLOUD_IMAGE" | awk '{print $1}')" == "${UBUNTU_CLOUD_IMAGE_SHA256,,}" ]]; then
+      qemu-img check "$UBUNTU_CLOUD_IMAGE" >/dev/null &&
+        ok "Ubuntu cloud image digest/format check" || bad "Ubuntu cloud image qemu-img check failed"
+    else
+      bad "Ubuntu cloud image is missing or does not match its pinned digest"
+    fi
+    [[ "$UBUNTU_CLOUD_SSH_KEY" == /* && -f "$UBUNTU_CLOUD_SSH_KEY" ]] &&
+      ok "Ubuntu cloud SSH public key" || bad "Ubuntu cloud SSH public key is missing"
+    [[ -r "$LIBGUESTFS_APPLIANCE_PATH/kernel" && -r "$LIBGUESTFS_APPLIANCE_PATH/initrd" &&
+       -r "$LIBGUESTFS_APPLIANCE_PATH/root" ]] ||
+      bad "libguestfs appliance is incomplete at $LIBGUESTFS_APPLIANCE_PATH"
+    continue
+  fi
   iso_var="${vm^^}_ISO"; sum_var="${vm^^}_ISO_SHA256"; iso="${!iso_var:-}"; sum="${!sum_var:-}"
   [[ -n "$iso" && -f "$iso" && "$sum" =~ ^[0-9a-fA-F]{64}$ ]] ||
     { bad "$vm installation media/checksum not configured"; continue; }

@@ -5,7 +5,11 @@ cmd="${1:-}"; shift || true
 vm_from_domain() { printf '%s' "${1#bvml-}"; }
 case "$cmd" in
   version) echo 'mock libvirt 1' ;;
-  dominfo) echo 'Id: -' ;;
+  dominfo)
+    vm="$(vm_from_domain "$1")"
+    [[ ! -e "$TEST_ROOT/undefined-$vm" ]] || exit 1
+    echo 'Id: -'
+    ;;
   domstate) vm="$(vm_from_domain "$1")"; cat "$TEST_ROOT/state-$vm" ;;
   domblklist)
     vm="$(vm_from_domain "$1")"
@@ -40,6 +44,10 @@ case "$cmd" in
     else
       printf '{"return":{"pid":42}}\n'
     fi
+    ;;
+  define)
+    rm -f -- "$TEST_ROOT/undefined-ubuntu"
+    printf 'define\n' >>"$TEST_ROOT/virsh.log"
     ;;
   list) : ;;
   *) echo "unsupported fake virsh command: $cmd" >&2; exit 2 ;;

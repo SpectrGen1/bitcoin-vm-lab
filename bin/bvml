@@ -5,6 +5,8 @@ cmd="${1:-help}"; shift || true
 case "$cmd" in
   host-setup) exec "$ROOT/scripts/host/setup-gentoo.sh" "$@" ;;
   host-validate) exec "$ROOT/scripts/host/validate-gentoo.sh" "$@" ;;
+  media-fetch|profiles-install|storage-prepare|guest-provision)
+    exec "$ROOT/scripts/provision.sh" "$cmd" "$@" ;;
   init|create|start|stop|discard|reset|reconcile|checkpoint-bootstrap|bootstrap-init|bootstrap-stop|bootstrap-verify|bootstrap-promote|bootstrap-cleanup|bootstrap-status|checkpoint-import|checkpoint-verify|checkpoint-promote|checkpoint-protect|checkpoint-rollback|rollback-remove|recovery-ack|adapter-setup|adapter-validate|adapter-status|validate|status)
     exec "$ROOT/scripts/vm/manage.sh" "$cmd" "$@" ;;
   test) exec "$ROOT/tests/run.sh" "$@" ;;
@@ -14,7 +16,13 @@ Commands:
   host-validate                  verify KVM, libvirt, UEFI, and storage access
   host-setup                     install/configure minimal Gentoo prerequisites
   init                           initialize system-libvirt storage
+  media-fetch ubuntu             stage a digest-pinned Ubuntu cloud image
+  profiles-install              verify/install signed Knots and RDTS profiles
+  storage-prepare               initialize storage and verify QEMU traversal
   create VM                      create a persistent VM from a verified ISO
+                                 or unattended pinned Ubuntu cloud image
+  guest-provision ubuntu         install verified guest assets through QGA
+                                 (refuses any active Bitcoin lifecycle)
   checkpoint-bootstrap           create/attach empty fresh-IBD disk to Ubuntu
   bootstrap-init --confirm-bootstrap-format
                                  explicitly initialize the bootstrap filesystem

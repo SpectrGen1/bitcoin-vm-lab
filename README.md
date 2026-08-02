@@ -23,11 +23,31 @@ Fresh Bitcoin Knots mainnet IBD is the normal initialization path:
 cp config/local.env.example config/local.env
 sudo ./bin/bvml host-setup
 ./bin/bvml host-validate
-./bin/bvml init
+./bin/bvml storage-prepare
+./bin/bvml media-fetch ubuntu
+./bin/bvml profiles-install
 ./bin/bvml create ubuntu
 ./bin/bvml checkpoint-bootstrap
 ./bin/bvml bootstrap-init --confirm-bootstrap-format
 ```
+
+With `UBUNTU_IMAGE_MODE=cloud`, these commands replace the formerly manual
+Ubuntu bridge. `media-fetch` requires an HTTPS URL plus a pinned SHA-256 and
+validates qcow2 structure. `profiles-install` verifies the exact configured
+signer over Knots' signed checksum metadata, proves that metadata binds the
+selected archive digest, and installs root-owned release/RDTS profiles.
+`storage-prepare` creates the configured storage hierarchy, grants only
+traversal where system QEMU needs it, verifies access, and checks bootstrap
+capacity. `create ubuntu` then clones the cloud image, provisions QEMU guest
+agent and all digest-pinned guest assets offline, injects the configured SSH
+public key, and defines the domain in exact `shut off` state without running
+Knots or attaching Bitcoin storage.
+
+All four provisioning commands take the repository lifecycle lock. They refuse
+to run while an owner record, Bitcoin attachment, or active VM exists.
+`guest-provision ubuntu` is an explicit QGA-based repair/update path for a
+running Ubuntu guest only when no Bitcoin lifecycle exists; it waits for the
+guest command and propagates failures.
 
 The bootstrap disk remains explicitly marked incomplete until authenticated
 Knots, the operator-approved digest-pinned release-specific RDTS profile,

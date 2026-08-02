@@ -31,5 +31,6 @@ case "$cmd" in
     [[ ! -e "$TEST_ROOT/fail-convert" ]] || exit 1
     in="${@: -2:1}"; out="${@: -1}"; printf 'standalone-from=%s\n' "$(sha256sum "$in" | awk '{print $1}')" >"$out"
     ;;
+  resize) : ;;
   *) exit 2 ;;
 esac

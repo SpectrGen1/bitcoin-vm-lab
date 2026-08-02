@@ -6,6 +6,14 @@ source "$BVML_ROOT/config/defaults.env"
 if [[ "${BVML_TESTING:-0}" != 1 && -f "$BVML_ROOT/config/local.env" ]]; then
   source "$BVML_ROOT/config/local.env"
 fi
+if [[ "${BVML_TESTING:-0}" != 1 && -f "$BVML_HOST_CONFIG_DIR/host.env" ]]; then
+  [[ "$(stat -c %u "$BVML_HOST_CONFIG_DIR/host.env")" == 0 &&
+     -z "$(find "$BVML_HOST_CONFIG_DIR/host.env" -maxdepth 0 -perm /022 -print -quit)" ]] ||
+    die_early="unsafe ownership or mode on $BVML_HOST_CONFIG_DIR/host.env"
+  [[ -z "${die_early:-}" ]] || { echo "error: $die_early" >&2; exit 1; }
+  # shellcheck source=/dev/null
+  source "$BVML_HOST_CONFIG_DIR/host.env"
+fi
 
 CANONICAL_DIR="$BVML_STORAGE/canonical"
 CANONICAL="$CANONICAL_DIR/bitcoin-mainnet.qcow2"
@@ -97,7 +105,7 @@ new_id() {
 
 validate_host_config_values() {
   local name value
-  for name in BVML_STORAGE CHECKPOINT_PROFILE_FILE; do
+  for name in BVML_STORAGE BVML_MEDIA_DIR BVML_HOST_CONFIG_DIR CHECKPOINT_PROFILE_FILE; do
     value="${!name:-}"
     [[ "$value" == /* && ! "$value" =~ [[:cntrl:]] && "$value" != *'"'* ]] ||
       die "$name must be an absolute path without quotes or control characters"
@@ -359,6 +367,23 @@ assert_initialization_state_empty() {
     "$OWNER_FILE" "$RECOVERY_META"; do
     [[ ! -e "$path" ]] || die "$requested cannot begin while lifecycle state exists: $path"
   done
+}
+
+assert_provisioning_safe() {
+  local vm state
+  assert_no_bitcoin_lifecycle
+  for vm in ubuntu umbrel startos; do
+    is_defined "$vm" || continue
+    state="$(domain_state "$vm")"
+    [[ "$state" == "shut off" ]] ||
+      die "provisioning is blocked while $(domain "$vm") is '$state'"
+  done
+}
+
+assert_no_bitcoin_lifecycle() {
+  [[ ! -e "$OWNER_FILE" ]] || die "provisioning is blocked while lifecycle ownership exists"
+  [[ "$(bitcoin_attachment_count)" == 0 ]] ||
+    die "provisioning is blocked while a Bitcoin data image is attached"
 }
 
 lifecycle_invariant_errors() {

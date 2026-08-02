@@ -149,6 +149,97 @@ t_canonical_wrong_profile() { setup_case; trap teardown_case EXIT; make_canonica
 t_overlay_generation_mismatch() { setup_case; trap teardown_case EXIT; make_canonical; make_stopped_overlay; sed -i 's/^checkpoint_generation=.*/checkpoint_generation=wrong/' "$BVML_STORAGE/active/manifest.env"; expect_fail bvml validate; bvml reset ubuntu >/dev/null; assert_absent "$BVML_STORAGE/active/bitcoin-mainnet-overlay.qcow2"; }
 t_adapter_profile_metadata() { assert_contains "$ROOT/scripts/vm/manage.sh" 'adapter-verification.json'; assert_contains "$ROOT/scripts/vm/manage.sh" 'profile_digest'; assert_contains "$ROOT/scripts/vm/validate.sh" 'verified guest adapter profile metadata'; }
 t_no_deleted_source() { ! rg -n '/home/brian/projects/bitcoin-knots-dev/bitcoin|BITCOIN_SOURCE' "$ROOT/config" "$ROOT/bin" "$ROOT/scripts" "$ROOT/README.md" "$ROOT/docs"; }
+t_provisioning_active_guard() {
+  setup_case; trap teardown_case EXIT
+  bvml checkpoint-bootstrap >/dev/null
+  expect_fail bvml media-fetch ubuntu
+  assert_contains "$TEST_ROOT/bvml-expected-failure.out" 'provisioning is blocked while lifecycle ownership exists'
+  assert_file "$BVML_STORAGE/active/bitcoin-mainnet-bootstrap.qcow2"
+  assert_file "$TEST_ROOT/attach-ubuntu"
+}
+t_media_existing() {
+  setup_case; trap teardown_case EXIT
+  export UBUNTU_IMAGE_MODE=cloud BVML_MEDIA_DIR="$TEST_ROOT/media"
+  export UBUNTU_CLOUD_IMAGE="$TEST_ROOT/media/ubuntu.qcow2"
+  export UBUNTU_CLOUD_IMAGE_URL=https://example.invalid/ubuntu.qcow2
+  mkdir -p "$BVML_MEDIA_DIR"
+  printf 'backing=\ncloud-image\n' >"$UBUNTU_CLOUD_IMAGE"
+  export UBUNTU_CLOUD_IMAGE_SHA256
+  UBUNTU_CLOUD_IMAGE_SHA256="$(sha256sum "$UBUNTU_CLOUD_IMAGE" | awk '{print $1}')"
+  bvml media-fetch ubuntu >/dev/null
+  assert_file "$UBUNTU_CLOUD_IMAGE"
+  assert_eq "$(stat -c %a "$UBUNTU_CLOUD_IMAGE")" 444
+}
+t_cloud_create_contract() {
+  local file="$ROOT/scripts/vm/create.sh"
+  assert_contains "$file" 'UBUNTU_IMAGE_MODE'
+  assert_contains "$file" 'UBUNTU_CLOUD_IMAGE_SHA256'
+  assert_contains "$file" 'LIBGUESTFS_BACKEND=direct'
+  assert_contains "$file" 'qemu-guest-agent,jq,curl,gnupg'
+  assert_contains "$file" '--ssh-inject'
+  assert_contains "$file" '--print-xml'
+  assert_contains "$file" 'virshq define'
+  assert_contains "$file" 'assert_provisioning_safe'
+}
+t_profile_install_contract() {
+  local file="$ROOT/scripts/provision.sh"
+  assert_contains "$file" 'VALIDSIG'
+  assert_contains "$file" 'authenticated metadata does not bind the archive'
+  assert_contains "$file" 'BVML_HOST_CONFIG_DIR/host.env'
+  assert_contains "$file" 'RDTS_REQUIRED_ARGS_JSON'
+  assert_contains "$file" 'assert_no_bitcoin_lifecycle'
+}
+t_profile_install_success() {
+  setup_case; trap teardown_case EXIT
+  export BVML_HOST_CONFIG_DIR="$TEST_ROOT/etc/bvml"
+  export KNOTS_VERSION_NORMALIZED=29.3.knots20260508
+  export KNOTS_ARTIFACT_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  export KNOTS_ARCHIVE_NAME=bitcoin-knots.tar.gz
+  export KNOTS_RELEASE_BASE_URL=https://example.invalid/release
+  export KNOTS_SHA256SUMS_SOURCE="$TEST_ROOT/SHA256SUMS"
+  export KNOTS_SHA256SUMS_ASC_SOURCE="$TEST_ROOT/SHA256SUMS.asc"
+  export KNOTS_SIGNING_KEY_SOURCE="$TEST_ROOT/signing-key.gpg"
+  export KNOTS_SIGNER_FINGERPRINT=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+  export KNOTS_RDTS_PROFILE_NAME=test-rdts
+  export KNOTS_RDTS_REQUIRED_ARGS_JSON='["-consensusrules=rdts"]'
+  printf '%s  %s\n' "$KNOTS_ARTIFACT_SHA256" "$KNOTS_ARCHIVE_NAME" >"$KNOTS_SHA256SUMS_SOURCE"
+  printf signature >"$KNOTS_SHA256SUMS_ASC_SOURCE"
+  printf key >"$KNOTS_SIGNING_KEY_SOURCE"
+  printf '#!/bin/sh\nprintf "[GNUPG:] VALIDSIG AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 2026-01-01 0 0 0 0 0 0 0 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\\n"\n' >"$TEST_ROOT/bin/gpgv"
+  chmod +x "$TEST_ROOT/bin/gpgv"
+  bvml profiles-install >/dev/null
+  assert_file "$BVML_HOST_CONFIG_DIR/host.env"
+  assert_file "$BVML_HOST_CONFIG_DIR/releases/knots-version.env"
+  assert_contains "$BVML_HOST_CONFIG_DIR/releases/knots-rdts.env" 'RDTS_REQUIRED_ARGS_JSON='
+  assert_contains "$BVML_HOST_CONFIG_DIR/host.env" 'KNOTS_RELEASE_PROFILE_SHA256='
+}
+t_cloud_create_success() {
+  setup_case; trap teardown_case EXIT
+  export UBUNTU_IMAGE_MODE=cloud UBUNTU_CLOUD_USER=ubuntu
+  export BVML_HOST_CONFIG_DIR="$TEST_ROOT/etc/bvml"
+  export UBUNTU_CLOUD_IMAGE="$TEST_ROOT/ubuntu-cloud.qcow2"
+  export UBUNTU_CLOUD_SSH_KEY="$TEST_ROOT/id.pub"
+  printf 'backing=\ncloud\n' >"$UBUNTU_CLOUD_IMAGE"
+  export UBUNTU_CLOUD_IMAGE_SHA256
+  UBUNTU_CLOUD_IMAGE_SHA256="$(sha256sum "$UBUNTU_CLOUD_IMAGE" | awk '{print $1}')"
+  printf ssh-key >"$UBUNTU_CLOUD_SSH_KEY"
+  mkdir -p "$BVML_HOST_CONFIG_DIR/releases"
+  for file in knots-version.env knots-rdts.env SHA256SUMS SHA256SUMS.asc signing-key.gpg; do
+    printf data >"$BVML_HOST_CONFIG_DIR/releases/$file"
+  done
+  cp "$ROOT/config/checkpoint-profile-none.json" "$BVML_HOST_CONFIG_DIR/checkpoint-profile.json"
+  touch "$TEST_ROOT/undefined-ubuntu"
+  printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nif [[ "${1:-}" == -E ]]; then shift; [[ "${1:-}" == env ]] && shift; while [[ "${1:-}" == *=* ]]; do shift; done; exec "$@"; fi\n[[ "${1:-}" == chown ]] && exit 0\nexec "$@"\n' >"$TEST_ROOT/bin/sudo"
+  printf '#!/bin/sh\nprintf "%%s\\n" "$*" >"$TEST_ROOT/virt-customize.log"\n' >"$TEST_ROOT/bin/virt-customize"
+  printf '#!/bin/sh\nprintf "<domain type=\\"kvm\\"><name>bvml-ubuntu</name></domain>\\n"\n' >"$TEST_ROOT/bin/virt-install"
+  chmod +x "$TEST_ROOT/bin/sudo" "$TEST_ROOT/bin/virt-customize" "$TEST_ROOT/bin/virt-install"
+  bvml create ubuntu >/dev/null
+  assert_file "$BVML_STORAGE/vms/ubuntu/system.qcow2"
+  assert_file "$BVML_STORAGE/vms/ubuntu/application.qcow2"
+  assert_contains "$TEST_ROOT/virt-customize.log" '--ssh-inject'
+  assert_contains "$TEST_ROOT/virsh.log" 'define'
+  assert_absent "$TEST_ROOT/undefined-ubuntu"
+}
 
 case_name="${2:-}"
 if [[ "${1:-}" == --case ]]; then
@@ -166,7 +257,9 @@ tests=(parallel nonoff failed_attach failed_owner failed_start detach_preserves 
   rollback_reverse mount_fail_closed ubuntu_stop_uninstalled start_invalidates protection_order bind_readonly adapters_fail_closed
   container_proc_inside live_rdts_validation container_runtime_args guest_exec_waits guest_exec_request_json guest_exec_failure_output old_tip_rejected required_index_missing
   status_attachment_exact canonical_missing_generation canonical_missing_immutable canonical_wrong_profile
-  overlay_generation_mismatch adapter_profile_metadata no_deleted_source)
+  overlay_generation_mismatch adapter_profile_metadata no_deleted_source provisioning_active_guard
+  media_existing cloud_create_contract profile_install_contract profile_install_success
+  cloud_create_success)
 passed=0 failed=0
 for test_name in "${tests[@]}"; do
   "$BASH" "$0" --case "$test_name"
