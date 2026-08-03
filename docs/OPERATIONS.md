@@ -74,7 +74,7 @@ cleanly stopped first.
 
 Provisioning commands hold the lifecycle lock. Profile mutation is refused
 while any bootstrap, canonical, overlay, verification, or recovery state
-exists. `guest-repair ubuntu --scripts-only` is the narrow repair path: it
+exists. `guest-repair {ubuntu|umbrel} --scripts-only` is the narrow repair path: it
 proves all installed profile digests and changes lifecycle code only. Failed
 downloads remove `.part` files; invalid media is quarantined. A failed
 cloud conversion/customization or domain definition retains the persistent VM
@@ -116,12 +116,12 @@ candidate is validated before canonical state changes.
 ./bin/bvml discard umbrel
 ```
 
-The normal `start umbrel`/`start startos` path requires previously recorded
-successful guest adapter metadata. For the first exact-package integration,
-use the explicit `start VM --adapter-setup` mode, immediately run
-`adapter-setup VM` and `adapter-validate VM`, then stop/discard. This exception
-is visible and exists only to bootstrap the persistent platform adapter; it
-does not mark the adapter ready by itself.
+For Umbrel, `guest-provision umbrel` records a profile-bound pending-overlay
+state, so normal `start umbrel` is available. It does not mark runtime
+validation successful. `adapter-setup umbrel` must mount and start the official
+app, and `adapter-validate umbrel` must record live proof before the cycle is
+considered validated. StartOS retains the explicit `--adapter-setup` recovery
+mode until its package implementation is available.
 
 `start` requires every domain to be exactly `shut off`, no owner, no retained
 overlay, and a protected canonical. Its fast canonical preflight checks
@@ -186,30 +186,58 @@ destination must have adequate space. Remove an obsolete rollback only with:
 the installed rollback fails validation, the swap is automatically reversed,
 the known-good canonical is reprotected, and recovery metadata is written.
 
-## UmbrelOS and StartOS
+## UmbrelOS
 
-Populate the exact templates under `templates/` only after inspecting a
-specific OS and Bitcoin package release. Install profiles root-owned and
-non-group/world-writable with SHA-256 sidecars. Umbrel also requires a
-digest-pinned versioned transformation script. It must verify the stock image,
-entrypoint, command, environment, mounts, runtime user, health, and endpoints;
-preserve the package integration behavior; then inject the read-only Knots
-release and complete overlay datadir. StartOS requires a digest-pinned versioned
-package implementation with fixed `apply`, `build`, `install`,
-interface/health, and competing-datadir verification actions. Profiles cannot
-supply arbitrary build/install command strings.
+The checked-in JSON profile is data-only and digest pinned. Configure a
+root/user-readable mode-0600 credentials JSON and a dedicated SSH keypair in
+`config/local.env`; neither secret is committed or printed.
 
-Both adapters locate the actual executable-backed Knots PID inside the managed
-container (PID 1 is not assumed), read that PID's command line inside the
-container, and verify binary digest, runtime user, mainnet, `blocksxor=0`,
-datadir, and exact RDTS values. After synchronous validation, the host records
-OS/package versions, profile and binary digests, adapter implementation
-version, result, and timestamp. `adapter-status` and full validation use this
-guest-derived metadata.
+`media-fetch umbrel` accepts only the profile's HTTPS URL and verifies SHA-256,
+byte size, ISO9660 label, and El Torito boot metadata. Invalid media is moved to
+the media quarantine. `create umbrel` defines a UEFI VM with persistent disks,
+management channel, and explicit disk serials. It OCR-matches every pinned
+installer prompt, proves the selected disk's serial/model/capacity, waits for
+completion, removes the installer, invokes the pinned `user.register` RPC,
+installs the management key, verifies umbrelOS 1.7.4, and shuts down.
+Prompt or onboarding drift leaves diagnostic state and fails—there is no
+manual continuation hidden in this workflow.
 
-Missing or mismatched versions fail closed. Host-level guessed bind mounts are
-not accepted. These integrations are not operational until populated profiles
-and the actual package/container `verify` commands pass.
+`guest-provision umbrel` installs `bitcoin-knots` with
+`umbreld client apps.install.mutate`, polls `apps.state.query`, stops it through
+`umbreld`, verifies the immutable app-store/package/image profile, resolves the
+real `exports.sh` datadir, quarantines any initial native datadir, and leaves a
+root-owned mode-0700 fail-closed mountpoint.
+
+During testing, `adapter-setup` identifies `/dev/vdc` by its lifecycle serial
+and filesystem UUID, mounts it directly at
+`app-data/bitcoin-knots/data/bitcoin`, writes only `blocksxor=0` into the
+overlay base config, and pre-seeds the exact app settings schema. Umbrel
+continues to own RPC, ZMQ, ports, Tor, I2P, and `umbrel-bitcoin.conf`; its
+unchanged `${APP_DATA_DIR}/data:/data` bind exposes the mounted child at
+`/data/bitcoin`.
+
+All app operations use `umbreld client`. Docker is read-only evidence:
+validation proves the official image and Compose service, UID, entrypoint,
+command, restart/grace behavior, sidecars, actual non-PID-1 Knots executable
+and digest, datadir, mainnet, generated `consensusrules=rdts`, non-XOR config,
+chain/index state, and fresh tip. Stop uses the official grace path, checks no
+process or open file remains, syncs, cleanly unmounts, restores the fail-closed
+mountpoint, then permits guest shutdown and host detachment. A busy mount or
+failed app operation leaves the overlay attached for recovery.
+
+Umbrel is always a consumer. Promotion rejects its overlay.
+
+The persistent VM disks use Virtio as `/dev/vda` and `/dev/vdb`, reserving
+`/dev/vdc` for the disposable Bitcoin overlay. Adapter code, its pinned
+profile, and lifecycle evidence are stored beneath Umbrel's persistent data
+directory in `.bvml`; umbrelOS does not retain ordinary writes to `/etc` or
+`/usr/local` across reboot.
+
+## StartOS
+
+StartOS remains fail-closed until a version-specific managed package override
+passes the same native lifecycle and runtime proof boundaries. It is not
+described as operational.
 
 ## Opt-in real-host integration tests
 

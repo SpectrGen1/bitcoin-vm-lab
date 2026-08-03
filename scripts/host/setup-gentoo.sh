@@ -11,8 +11,9 @@ trap 'rm -f -- "$tmp"' EXIT
 printf '%s\n' \
   '# bitcoin-vm-lab: system QEMU, daemon, NAT network, and libguestfs' \
   'app-emulation/libvirt libvirtd qemu virt-network' \
-  'app-emulation/qemu spice vnc' \
-  'media-libs/netpbm png' \
+	  'app-emulation/qemu spice vnc' \
+	  'media-libs/leptonica jpeg png tiff' \
+	  'media-libs/netpbm png' \
   'net-dns/dnsmasq script' \
   'net-libs/gnutls pkcs11 tools' >"$tmp"
 if [[ ! -f /etc/portage/package.use/bitcoin-vm-lab ]] ||
@@ -20,10 +21,14 @@ if [[ ! -f /etc/portage/package.use/bitcoin-vm-lab ]] ||
   install -m 0644 "$tmp" /etc/portage/package.use/bitcoin-vm-lab
 fi
 
-emerge --ask app-emulation/qemu app-emulation/libvirt app-emulation/virt-manager \
+emerge --noreplace app-emulation/qemu app-emulation/libvirt app-emulation/virt-manager \
   app-emulation/libguestfs app-emulation/libguestfs-appliance \
   sys-firmware/edk2-bin sys-apps/acl app-misc/jq app-crypt/gnupg net-misc/curl \
-  net-misc/bridge-utils sys-fs/e2fsprogs dev-libs/libxml2 sys-process/lsof
+	  net-misc/bridge-utils net-misc/sshpass app-text/tesseract \
+	  sys-fs/e2fsprogs dev-libs/libxml2 sys-process/lsof sys-process/psmisc
+# Tesseract initializes its built-in font through Leptonica's TIFF loader even
+# when the captured libvirt screenshot itself is PNG.
+emerge --newuse media-libs/leptonica app-text/tesseract
 rc-update add libvirtd default
 rc-service libvirtd status >/dev/null 2>&1 || rc-service libvirtd start
 

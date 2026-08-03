@@ -51,8 +51,10 @@ to run while an owner record, Bitcoin attachment, or active VM exists.
 `guest-provision ubuntu` is an explicit QGA-based repair/update path for a
 running Ubuntu guest only when no Bitcoin lifecycle exists; it waits for the
 guest command and propagates failures.
-`guest-repair ubuntu --scripts-only` updates lifecycle code only after proving
-all guest profile digests are unchanged. Profile replacement is refused once
+`guest-repair {ubuntu|umbrel} --scripts-only` updates lifecycle code only after
+proving all guest profile digests are unchanged. Umbrel adapter assets live
+beneath its persistent data directory, not its immutable `/etc` or `/usr/local`
+trees. Profile replacement is refused once
 bootstrap, canonical, overlay, verification, or recovery state exists.
 
 The bootstrap disk remains explicitly marked incomplete until authenticated
@@ -75,12 +77,37 @@ An existing datadir is optional and has no default:
 ```
 
 Import rejects XOR block storage and requires an explicit stopped-node or
-snapshot assertion. Umbrel and StartOS adapters require exact-version,
-digest-pinned implementation scripts that preserve package entrypoints,
-health/dependency interfaces, and integration behavior. Both locate and inspect
-the actual in-container Knots process rather than assuming PID 1. Neither is
-reported ready until its managed package passes verification and the host
-records that guest profile metadata.
+snapshot assertion.
+
+UmbrelOS is a pinned, unattended target:
+
+```bash
+./bin/bvml credentials-init umbrel
+./bin/bvml media-fetch umbrel
+./bin/bvml create umbrel
+./bin/bvml guest-provision umbrel
+./bin/bvml start umbrel
+./bin/bvml adapter-setup umbrel
+./bin/bvml adapter-validate umbrel
+./bin/bvml stop umbrel
+./bin/bvml discard umbrel
+```
+
+The immutable profile pins umbrelOS 1.7.4 and official app
+`bitcoin-knots` 1.2.12-patch.1, including installer, app-store commit,
+package files, OCI images, bundled Knots executable, settings schema, and
+production Compose contract. The installer is driven only after OCR prompt,
+disk serial, model, and capacity checks. Onboarding uses the pinned public
+`user.register` RPC and installs a dedicated SSH key without logging
+credentials. `guest-provision` installs the official app through `umbreld`.
+The adapter mounts the disposable overlay at Umbrel's normal
+`app-data/bitcoin-knots/data/bitcoin`; the unchanged parent bind exposes it as
+`/data/bitcoin`. App start, restart, and stop use `umbreld`; Docker is
+inspection-only. Any version, package, mount, process, binary, RDTS, index,
+sidecar, or tip-freshness mismatch fails closed and preserves the overlay.
+
+StartOS remains version-gated and unavailable until its package profile is
+implemented and verified. Neither platform may promote a checkpoint.
 
 See [the operations guide](docs/OPERATIONS.md), `./bin/bvml help`, and
 `./bin/bvml test`.

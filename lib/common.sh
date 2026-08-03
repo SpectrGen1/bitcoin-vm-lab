@@ -40,6 +40,7 @@ OWNER_FILE="$RUN_DIR/owner.env"
 LOCK_FILE="$RUN_DIR/storage.lock"
 RECOVERY_META="$RUN_DIR/recovery.env"
 ADAPTER_STATE_DIR="$RUN_DIR/adapters"
+ADAPTER_RECOVERY_META="$RUN_DIR/umbrel-recovery.env"
 
 die() { echo "error: $*" >&2; exit 1; }
 note() { echo "==> $*"; }
@@ -81,6 +82,57 @@ guest_exec_sync() {
     (( waited++ < timeout )) || die "$vm guest command '$path $*' timed out after ${timeout}s"
     sleep 1
   done
+}
+domain_ipv4() {
+  local vm="$1" address
+  address="$({ virshq domifaddr "$(domain "$vm")" --source agent 2>/dev/null || true; } |
+    awk '$3 == "ipv4" {sub(/\/.*/, "", $4); print $4; exit}')"
+  [[ -n "$address" ]] || address="$({ virshq domifaddr "$(domain "$vm")" --source lease 2>/dev/null || true; } |
+    awk '$3 == "ipv4" {sub(/\/.*/, "", $4); print $4; exit}')"
+  printf '%s\n' "$address"
+}
+umbrel_exec_sync() {
+  local path="$1" timeout="$2"; shift 2
+  if virshq qemu-agent-command "$(domain umbrel)" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+    guest_exec_sync umbrel "$path" "$timeout" "$@"
+    return
+  fi
+  [[ "$UMBREL_SSH_PRIVATE_KEY" == /* && -f "$UMBREL_SSH_PRIVATE_KEY" ]] ||
+    die "Umbrel QGA is unavailable and UMBREL_SSH_PRIVATE_KEY is not configured"
+  local address="${UMBREL_MANAGEMENT_ADDRESS:-}" output status password remote_command arg
+  [[ -n "$address" ]] || address="$(domain_ipv4 umbrel)"
+  [[ "$address" =~ ^[A-Za-z0-9:.%-]+$ ]] || die "could not resolve a safe Umbrel management address"
+  [[ "$UMBREL_CREDENTIALS_FILE" == /* && -f "$UMBREL_CREDENTIALS_FILE" ]] ||
+    die "Umbrel SSH management requires the protected UMBREL_CREDENTIALS_FILE"
+  password="$(jq -er '.password | select(type=="string" and length>=12)' "$UMBREL_CREDENTIALS_FILE")" ||
+    die "Umbrel management credential file lacks a valid password"
+  printf -v remote_command 'sudo -S -p %q -- %q' '' "$path"
+  for arg in "$@"; do
+    printf -v remote_command '%s %q' "$remote_command" "$arg"
+  done
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    set +e
+    output="$(printf '%s\n' "$password" | timeout "$timeout" ssh -i "$UMBREL_SSH_PRIVATE_KEY" \
+      -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+      "$UMBREL_SSH_USER@$address" "$remote_command" 2>&1)"
+    status=$?
+    set -e
+    (( status != 0 )) &&
+      grep -Eq 'incorrect password attempt|no password was provided' <<<"$output" &&
+      (( attempt < 5 )) || break
+    sleep 2
+  done
+  unset password
+  [[ -z "$output" ]] || printf '%s\n' "$output"
+  [[ "$status" == 0 ]] || die "Umbrel SSH command '$path $*' failed with exit $status"
+  GUEST_EXEC_STDOUT="$output"
+}
+platform_exec_sync() {
+  local vm="$1" path="$2" timeout="$3"; shift 3
+  if [[ "$vm" == umbrel ]]; then umbrel_exec_sync "$path" "$timeout" "$@"
+  else guest_exec_sync "$vm" "$path" "$timeout" "$@"
+  fi
 }
 virt_customize_offline() {
   LIBGUESTFS_PATH="$LIBGUESTFS_APPLIANCE_PATH" LIBGUESTFS_BACKEND=direct \
@@ -126,7 +178,7 @@ new_id() {
 
 validate_host_config_values() {
   local name value
-  for name in BVML_STORAGE BVML_MEDIA_DIR BVML_HOST_CONFIG_DIR CHECKPOINT_PROFILE_FILE CHECKPOINT_PROFILE_SOURCE; do
+  for name in BVML_STORAGE BVML_MEDIA_DIR BVML_HOST_CONFIG_DIR CHECKPOINT_PROFILE_FILE CHECKPOINT_PROFILE_SOURCE UMBREL_PROFILE; do
     value="${!name:-}"
     [[ "$value" == /* && ! "$value" =~ [[:cntrl:]] && "$value" != *'"'* ]] ||
       die "$name must be an absolute path without quotes or control characters"

@@ -55,6 +55,7 @@ transactional_attach_start() {
       write_env_file "$meta" \
         "kind=overlay" "vm=$vm" "canonical_id=$(canonical_id)" "created=$(date -u +%FT%TZ)" \
         "backing=$CANONICAL" "overlay_id=$identity" "checkpoint_generation=$(checkpoint_generation)" \
+        "size_bytes=$(qemu-img info --output=json "$CANONICAL" | jq -r '.["virtual-size"]')" \
         "disk_serial=$serial"
       ;;
     bootstrap)
@@ -126,9 +127,14 @@ start_vm() {
     if [[ "$mode" == --adapter-setup ]]; then
       note "$vm is entering explicit unverified adapter-setup mode"
     else
-      jq -e --arg platform "$vm" '.platform == $platform and .last_validation_result == "ok"' \
+      jq -e --arg platform "$vm" --arg umbrel_profile "${UMBREL_PROFILE_SHA256,,}" '
+        .platform == $platform and
+        (.last_validation_result == "ok" or
+          ($platform == "umbrel" and .provisioning_result == "ok" and
+           .profile_digest == $umbrel_profile))
+      ' \
         "$ADAPTER_STATE_DIR/$vm.json" >/dev/null 2>&1 ||
-        die "$vm adapter is not verified; use 'start $vm --adapter-setup', then adapter-setup/adapter-validate"
+        die "$vm adapter is not provisioned; run guest-provision or use explicit adapter-setup recovery mode"
     fi
   elif [[ -n "$mode" ]]; then
     die "--adapter-setup is only valid for UmbrelOS or StartOS"
@@ -148,10 +154,10 @@ guest_application_stop() {
   local vm="$1" script
   case "$vm" in
     ubuntu) script=/usr/local/libexec/bvml/ubuntu-knots-rdts.sh ;;
-    umbrel) script=/usr/local/libexec/bvml/umbrel-adapter.sh ;;
+    umbrel) script="$(jq -r .os.data_directory "$UMBREL_PROFILE")/.bvml/bin/umbrel-adapter.sh" ;;
     startos) script=/usr/local/libexec/bvml/startos-adapter.sh ;;
   esac
-  guest_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" stop
+  platform_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" stop
 }
 
 stop_vm() {
@@ -159,7 +165,11 @@ stop_vm() {
   assert_consistent_owner
   [[ "$(owner_vm)" == "$vm" && "$(overlay_vm)" == "$vm" ]] || die "$vm does not own the active overlay"
   if ! is_shut_off "$vm"; then
-    guest_application_stop "$vm"
+    if ! (guest_application_stop "$vm"); then
+      write_env_file "$ADAPTER_RECOVERY_META" "operation=application-stop" "vm=$vm" \
+        "image=$OVERLAY" "result=recovery-required" "recorded=$(date -u +%FT%TZ)"
+      die "$vm application stop failed; VM, mount, attachment, owner, and overlay were preserved"
+    fi
     virshq shutdown "$(domain "$vm")"
     while ! is_shut_off "$vm"; do
       (( waited >= SHUTDOWN_TIMEOUT )) && die "shutdown timeout; attachment and ownership retained"
@@ -170,6 +180,7 @@ stop_vm() {
   [[ -z "$(attached_vm_for_path "$OVERLAY")" ]] || die "overlay still attached; ownership retained"
   assert_no_process_reference "$OVERLAY"
   rm -f -- "$OWNER_FILE"
+  [[ "$vm" != umbrel ]] || rm -f -- "$ADAPTER_RECOVERY_META"
   note "$vm is shut off and detached; its overlay is retained for discard or promotion"
 }
 
@@ -187,6 +198,9 @@ discard_overlay() {
 
 reconcile_owner() {
   local attached owner kind image meta manifest_vm manifest_id owner_id manifest_serial owner_serial
+  if [[ -f "$ADAPTER_RECOVERY_META" ]] && ! is_shut_off umbrel; then
+    die "Umbrel recovery is active while the VM is $(domain_state umbrel); inspect umbreld app state, container process, datadir mount, attachment, and owner before clean stop"
+  fi
   all_shut_off
   owner="$(owner_vm)"
   if [[ -n "$owner" ]]; then
@@ -210,6 +224,7 @@ reconcile_owner() {
     [[ "$(bitcoin_attachment_count)" == 0 ]] || die "conflicting Bitcoin storage attachment exists"
     [[ ! -f "$OVERLAY" || ! -f "$BOOTSTRAP" ]] || die "bootstrap and ordinary overlay coexist"
     rm -f -- "$OWNER_FILE"
+    [[ "$owner" != umbrel ]] || rm -f -- "$ADAPTER_RECOVERY_META"
     note "cleared stale detached $kind owner for retained $owner image"
   else note "owner state is already reconciled"; fi
 }
@@ -772,10 +787,40 @@ adapter_guest_action() {
   [[ "$vm" != ubuntu ]] || die "Ubuntu uses its Knots bootstrap module, not a platform package adapter"
   [[ "$(owner_vm)" == "$vm" && ! "$(is_shut_off "$vm" && echo yes)" == yes ]] ||
     die "$vm must actively own the overlay"
-  local script="/usr/local/libexec/bvml/${vm}-adapter.sh"
-  guest_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" "$action"
-  [[ "$action" == verify ]] || guest_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" verify
-  guest_exec_sync "$vm" /bin/cat 30 /etc/bvml/adapter-verification.json
+  local script="/usr/local/libexec/bvml/${vm}-adapter.sh" evidence=/etc/bvml/adapter-verification.json
+  if [[ "$vm" == umbrel ]]; then
+    local active_json active64 guest_bvml
+    guest_bvml="$(jq -r .os.data_directory "$UMBREL_PROFILE")/.bvml"
+    script="$guest_bvml/bin/umbrel-adapter.sh"
+    evidence="$guest_bvml/etc/adapter-verification.json"
+    active_json="$(jq -n --arg overlay "$(overlay_id)" --arg canonical "$(canonical_id)" \
+      --arg generation "$(checkpoint_generation)" \
+      --arg serial "$(meta_get "$OVERLAY_META" disk_serial)" \
+	      --arg uuid "$(meta_get "$CANONICAL_META" filesystem_uuid)" \
+      --arg checkpoint_profile_id "$(meta_get "$CANONICAL_META" checkpoint_profile_id)" \
+      --arg checkpoint_profile_sha256 "$(meta_get "$CANONICAL_META" checkpoint_profile_sha256)" \
+      --argjson size "$(meta_get "$OVERLAY_META" size_bytes)" \
+      --argjson height "$(meta_get "$CANONICAL_META" block_height)" \
+      '{overlay_id:$overlay,canonical_id:$canonical,checkpoint_generation:$generation,
+        disk_serial:$serial,filesystem_uuid:$uuid,size_bytes:$size,
+        expected_minimum_height:$height,checkpoint_profile_id:$checkpoint_profile_id,
+        checkpoint_profile_sha256:$checkpoint_profile_sha256}')"
+    active64="$(base64 -w0 <<<"$active_json")"
+    umbrel_exec_sync /bin/bash 60 -c \
+	      "printf %s '$active64' | base64 -d > '$guest_bvml/etc/active-overlay.json'; chown root:root '$guest_bvml/etc/active-overlay.json'; chmod 0600 '$guest_bvml/etc/active-overlay.json'"
+  fi
+  if ! (platform_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" "$action"); then
+    write_env_file "$ADAPTER_RECOVERY_META" "operation=adapter-$action" "vm=$vm" \
+      "image=$OVERLAY" "result=recovery-required" "recorded=$(date -u +%FT%TZ)"
+    die "$vm adapter $action failed; active state and diagnostics were preserved"
+  fi
+  if [[ "$action" != verify ]] &&
+     ! (platform_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" verify); then
+    write_env_file "$ADAPTER_RECOVERY_META" "operation=adapter-verify" "vm=$vm" \
+      "image=$OVERLAY" "result=recovery-required" "recorded=$(date -u +%FT%TZ)"
+    die "$vm post-setup verification failed; active state and diagnostics were preserved"
+  fi
+  platform_exec_sync "$vm" /bin/cat 30 "$evidence"
   local tmp="$ADAPTER_STATE_DIR/$vm.json.new"
   printf '%s\n' "$GUEST_EXEC_STDOUT" >"$tmp"
   jq -e --arg platform "$vm" '
@@ -785,6 +830,7 @@ adapter_guest_action() {
   ' "$tmp" >/dev/null || { rm -f -- "$tmp"; die "$vm returned invalid adapter verification metadata"; }
   chmod 0600 "$tmp"
   mv -- "$tmp" "$ADAPTER_STATE_DIR/$vm.json"
+  [[ "$vm" != umbrel ]] || rm -f -- "$ADAPTER_RECOVERY_META"
   note "$vm adapter $action completed and verified guest profile metadata was recorded"
 }
 

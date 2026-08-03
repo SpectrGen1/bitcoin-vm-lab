@@ -5,7 +5,8 @@ source "$ROOT/lib/common.sh"
 command="${1:?provisioning command required}"; shift
 
 fetch_to() {
-  local source="$1" destination="$2" tmp="$destination.part"
+  local source="$1" destination="$2" tmp
+  tmp="$destination.part"
   [[ "$source" == https://* ]] || die "download source must use HTTPS: $source"
   need curl
   rm -f -- "$tmp"
@@ -27,7 +28,12 @@ copy_or_fetch() {
 }
 
 media_fetch() {
-  [[ "${1:-}" == ubuntu && $# == 1 ]] || die "usage: bvml media-fetch ubuntu"
+  [[ $# == 1 ]] || die "usage: bvml media-fetch {ubuntu|umbrel}"
+  if [[ "$1" == umbrel ]]; then
+    media_fetch_umbrel
+    return
+  fi
+  [[ "$1" == ubuntu ]] || die "usage: bvml media-fetch {ubuntu|umbrel}"
   assert_provisioning_safe
   [[ "$UBUNTU_IMAGE_MODE" == cloud ]] ||
     die "media-fetch ubuntu requires UBUNTU_IMAGE_MODE=cloud"
@@ -45,6 +51,62 @@ media_fetch() {
   fetch_to "$UBUNTU_CLOUD_IMAGE_URL" "$UBUNTU_CLOUD_IMAGE"
   validate_cloud_image "$UBUNTU_CLOUD_IMAGE" "$UBUNTU_CLOUD_IMAGE_SHA256"
   note "staged verified Ubuntu cloud image at $UBUNTU_CLOUD_IMAGE"
+}
+
+validate_umbrel_profile() {
+  [[ "$UMBREL_PROFILE" == /* && -f "$UMBREL_PROFILE" &&
+     "$UMBREL_PROFILE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] ||
+    die "configure an absolute digest-pinned UMBREL_PROFILE"
+  [[ "$(sha256sum "$UMBREL_PROFILE" | awk '{print $1}')" == "${UMBREL_PROFILE_SHA256,,}" ]] ||
+    die "Umbrel profile digest mismatch"
+  jq -e '
+    .profile_version==1 and (.os.installer_url|startswith("https://"))
+  ' "$UMBREL_PROFILE" >/dev/null || die "Umbrel profile is malformed"
+  [[ "$(jq -r .os.installer_sha256 "$UMBREL_PROFILE")" == "${UMBREL_ISO_SHA256,,}" ]] ||
+    die "configured Umbrel installer digest differs from the profile"
+}
+
+validate_umbrel_media() {
+  local image="$1" expected="$2" actual label info
+  actual="$(sha256sum "$image" | awk '{print $1}')"
+  [[ "$actual" == "${expected,,}" ]] || return 1
+  [[ "$(stat -c %s "$image")" == "$(jq -r .os.installer_size "$UMBREL_PROFILE")" ]] || return 1
+  file "$image" | grep -qi 'ISO 9660' || return 1
+  label="$(xorriso -indev "$image" -pvd_info 2>&1 |
+    sed -n "s/^Volume id[[:space:]]*:[[:space:]]*'\\(.*\\)'/\\1/p")"
+  [[ "$label" == "$(jq -r .os.iso_label "$UMBREL_PROFILE")" ]] || return 1
+  info="$(xorriso -indev "$image" -report_el_torito plain 2>&1)"
+  grep -qi 'boot' <<<"$info" || return 1
+}
+
+media_fetch_umbrel() {
+  assert_provisioning_safe
+  validate_umbrel_profile
+  need xorriso; need file; need sha256sum
+  install -d -m 0755 "$BVML_MEDIA_DIR" "$BVML_MEDIA_DIR/quarantine"
+  local url staged="$UMBREL_ISO" quarantine
+  url="$(jq -r .os.installer_url "$UMBREL_PROFILE")"
+  [[ "$url" == https://* ]] || die "Umbrel installer URL must use HTTPS"
+  if [[ ! -f "$staged" ]]; then fetch_to "$url" "$staged"; fi
+  if ! validate_umbrel_media "$staged" "$UMBREL_ISO_SHA256"; then
+    quarantine="$BVML_MEDIA_DIR/quarantine/$(basename "$staged").$(date -u +%Y%m%dT%H%M%SZ)"
+    mv -- "$staged" "$quarantine"
+    die "Umbrel media failed digest/ISO/boot validation and was quarantined at $quarantine"
+  fi
+  [[ "$(stat -c %a "$staged")" == 444 ]] || chmod 0444 "$staged"
+  local manifest_tmp
+  manifest_tmp="$(mktemp "$BVML_MEDIA_DIR/.umbrel-media-manifest.XXXXXX")"
+  jq -n --arg profile "${UMBREL_PROFILE_SHA256,,}" \
+    --arg profile_id "$(jq -r .profile_id "$UMBREL_PROFILE")" \
+    --arg installer_commit "$(jq -r .os.installer_source_commit "$UMBREL_PROFILE")" \
+    --arg sha "${UMBREL_ISO_SHA256,,}" \
+    --arg path "$staged" --arg now "$(date -u +%FT%TZ)" \
+    '{platform:"umbrel",profile_id:$profile_id,profile_digest:$profile,
+      installer_source_commit:$installer_commit,sha256:$sha,path:$path,verified_at:$now}' \
+    >"$manifest_tmp"
+  chmod 0444 "$manifest_tmp"
+  mv -f -- "$manifest_tmp" "$staged.manifest.json"
+  note "staged structurally validated, profile-bound UmbrelOS installer"
 }
 
 assert_profile_mutation_safe() {
@@ -192,7 +254,12 @@ storage_prepare() {
 }
 
 guest_provision() {
-  [[ "${1:-}" == ubuntu && $# == 1 ]] || die "usage: bvml guest-provision ubuntu"
+  [[ $# == 1 ]] || die "usage: bvml guest-provision {ubuntu|umbrel}"
+  if [[ "$1" == umbrel ]]; then
+    guest_provision_umbrel
+    return
+  fi
+  [[ "$1" == ubuntu ]] || die "usage: bvml guest-provision {ubuntu|umbrel}"
   assert_no_bitcoin_lifecycle
   is_defined ubuntu || die "Ubuntu VM is not defined"
   [[ "$(domain_state ubuntu)" == running ]] || die "Ubuntu must be exactly running for QGA provisioning"
@@ -246,9 +313,91 @@ guest_provision() {
   note "provisioned Ubuntu guest assets through synchronous QGA execution"
 }
 
+guest_provision_umbrel() {
+  assert_no_bitcoin_lifecycle
+  validate_umbrel_profile
+  is_defined umbrel || die "Umbrel VM is not defined"
+  [[ "$(domain_state umbrel)" == running ]] || die "Umbrel must be exactly running"
+  local other
+  for other in ubuntu startos; do
+    is_defined "$other" || continue
+    is_shut_off "$other" || die "$(domain "$other") must be exactly shut off"
+  done
+  bash -n "$ROOT/scripts/vm/guest/umbrel-adapter.sh" \
+    "$ROOT/scripts/vm/guest/adapter-common.sh" ||
+    die "Umbrel guest adapter assets fail shell syntax validation"
+  local profile64 digest64 adapter64 common64 active_stub64 guest_root guest_bvml
+  guest_root="$(jq -er '.os.data_directory | select(startswith("/"))' "$UMBREL_PROFILE")" ||
+    die "Umbrel profile lacks an absolute persistent data directory"
+  [[ ! "$guest_root" =~ [[:cntrl:]] ]] || die "unsafe Umbrel persistent data directory"
+  guest_bvml="$guest_root/.bvml"
+  profile64="$(base64 -w0 "$UMBREL_PROFILE")"
+  digest64="$(printf '%s\n' "${UMBREL_PROFILE_SHA256,,}" | base64 -w0)"
+  adapter64="$(base64 -w0 "$ROOT/scripts/vm/guest/umbrel-adapter.sh")"
+  common64="$(base64 -w0 "$ROOT/scripts/vm/guest/adapter-common.sh")"
+  active_stub64="$(printf '{}\n' | base64 -w0)"
+  umbrel_exec_sync /bin/bash "$GUEST_EXEC_TIMEOUT" -c "
+    install -d -o root -g root -m 0755 '$guest_bvml/etc' '$guest_bvml/bin'
+    printf %s '$profile64' | base64 -d > '$guest_bvml/etc/umbrel-profile.json'
+    printf %s '$digest64' | base64 -d > '$guest_bvml/etc/umbrel-profile.sha256'
+    printf %s '$adapter64' | base64 -d > '$guest_bvml/bin/umbrel-adapter.sh'
+    printf %s '$common64' | base64 -d > '$guest_bvml/bin/adapter-common.sh'
+    printf %s '$active_stub64' | base64 -d > '$guest_bvml/etc/active-overlay.json'
+    chown -R root:root '$guest_bvml'
+    chmod 0644 '$guest_bvml/etc/umbrel-profile.json' '$guest_bvml/etc/umbrel-profile.sha256'
+    chmod 0600 '$guest_bvml/etc/active-overlay.json'
+    chmod 0755 '$guest_bvml/bin/umbrel-adapter.sh' '$guest_bvml/bin/adapter-common.sh'
+  "
+  umbrel_exec_sync "$guest_bvml/bin/umbrel-adapter.sh" "$UMBREL_OPERATION_TIMEOUT" install-app
+  install -d -m 0750 "$ADAPTER_STATE_DIR"
+  jq -n --arg platform umbrel --arg profile "${UMBREL_PROFILE_SHA256,,}" \
+    --arg os "$(jq -r .os.version "$UMBREL_PROFILE")" \
+    --arg package "$(jq -r .app_store.app_version "$UMBREL_PROFILE")" \
+    --arg implementation "$(jq -r .adapter_implementation_version "$UMBREL_PROFILE")" \
+    --arg now "$(date -u +%FT%TZ)" \
+    '{platform:$platform,os_version:$os,package_version:$package,
+      profile_digest:$profile,adapter_implementation_version:$implementation,
+      provisioning_result:"ok",provisioned_at:$now,last_validation_result:"pending-overlay"}' \
+    >"$ADAPTER_STATE_DIR/umbrel.json"
+  chmod 0600 "$ADAPTER_STATE_DIR/umbrel.json"
+  note "installed and stopped the pinned official bitcoin-knots app through umbreld"
+}
+
 guest_repair_scripts() {
-  [[ "${1:-}" == ubuntu && "${2:-}" == --scripts-only && $# == 2 ]] ||
-    die "usage: bvml guest-repair ubuntu --scripts-only"
+  [[ "${2:-}" == --scripts-only && $# == 2 ]] ||
+    die "usage: bvml guest-repair {ubuntu|umbrel} --scripts-only"
+  if [[ "$1" == umbrel ]]; then
+    is_defined umbrel || die "Umbrel VM is not defined"
+    [[ "$(domain_state umbrel)" == running ]] || die "Umbrel must be exactly running"
+    bash -n "$ROOT/scripts/vm/guest/umbrel-adapter.sh" \
+      "$ROOT/scripts/vm/guest/adapter-common.sh" ||
+      die "Umbrel guest adapter assets fail shell syntax validation"
+    local guest_bvml adapter64 common64
+    guest_bvml="$(jq -er '.os.data_directory | select(startswith("/"))' "$UMBREL_PROFILE")/.bvml" ||
+      die "Umbrel profile lacks an absolute persistent data directory"
+    umbrel_exec_sync /bin/bash 60 -c "
+      test \"\$(sha256sum '$guest_bvml/etc/umbrel-profile.json' | awk '{print \$1}')\" = '${UMBREL_PROFILE_SHA256,,}'
+      test \"\$(tr -d '[:space:]' <'$guest_bvml/etc/umbrel-profile.sha256')\" = '${UMBREL_PROFILE_SHA256,,}'
+    " || die "Umbrel script repair refused because the installed profile digest changed"
+    adapter64="$(base64 -w0 "$ROOT/scripts/vm/guest/umbrel-adapter.sh")"
+    common64="$(base64 -w0 "$ROOT/scripts/vm/guest/adapter-common.sh")"
+    umbrel_exec_sync /bin/bash 60 -c "
+      set -Eeuo pipefail
+      a=\$(mktemp '$guest_bvml/bin/umbrel-adapter.sh.XXXXXX')
+      c=\$(mktemp '$guest_bvml/bin/adapter-common.sh.XXXXXX')
+      trap 'rm -f -- \"\$a\" \"\$c\"' EXIT
+      printf %s '$adapter64' | base64 -d >\"\$a\"
+      printf %s '$common64' | base64 -d >\"\$c\"
+      chown root:root \"\$a\" \"\$c\"; chmod 0755 \"\$a\" \"\$c\"
+      bash -n \"\$a\" \"\$c\"
+      mv -f -- \"\$a\" '$guest_bvml/bin/umbrel-adapter.sh'
+      mv -f -- \"\$c\" '$guest_bvml/bin/adapter-common.sh'
+      trap - EXIT
+    "
+    note "updated persistent Umbrel adapter scripts after proving its profile digest is unchanged"
+    return
+  fi
+  [[ "$1" == ubuntu ]] || die "usage: bvml guest-repair {ubuntu|umbrel} --scripts-only"
   is_defined ubuntu || die "Ubuntu VM is not defined"
   [[ "$(domain_state ubuntu)" == running ]] || die "Ubuntu must be exactly running"
   local vm

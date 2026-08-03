@@ -6,7 +6,7 @@ failed=0
 bad() { echo "FAIL $*" >&2; failed=1; }
 ok() { echo "ok   $*"; }
 
-for cmd in virsh qemu-img flock sha256sum jq xmllint virt-ls virt-cat virt-customize virt-filesystems; do
+for cmd in virsh qemu-img flock sha256sum jq xmllint virt-ls virt-cat virt-customize virt-filesystems xorriso file tesseract sshpass; do
   command -v "$cmd" >/dev/null && ok "command $cmd" || bad "missing command $cmd"
 done
 virshq version >/dev/null 2>&1 && ok "libvirt connectivity" || bad "cannot connect to $LIBVIRT_URI"
@@ -104,8 +104,21 @@ for vm in ubuntu umbrel startos; do
     ok "$vm installation media checksum" || bad "$vm installation media checksum mismatch"
 done
 for platform in umbrel startos; do
-  [[ -f "$ROOT/templates/$platform/profile.env.example" && -x "$ROOT/scripts/vm/guest/$platform-adapter.sh" ]] ||
-    bad "$platform package adapter module missing"
+  if [[ "$platform" == umbrel ]]; then
+    [[ -f "$UMBREL_PROFILE" && -x "$ROOT/scripts/vm/guest/umbrel-adapter.sh" &&
+       "$(sha256sum "$UMBREL_PROFILE" | awk '{print $1}')" == "${UMBREL_PROFILE_SHA256,,}" ]] ||
+      bad "Umbrel immutable profile or native-package adapter is missing"
+    if [[ -f "$UMBREL_ISO" ]]; then
+      [[ "$(sha256sum "$UMBREL_ISO" | awk '{print $1}')" == "${UMBREL_ISO_SHA256,,}" &&
+         -f "$UMBREL_ISO.manifest.json" ]] &&
+        ok "Umbrel installer is digest-pinned and profile-bound" ||
+        bad "Umbrel installer or generation manifest is invalid"
+    fi
+  else
+    [[ -f "$ROOT/templates/$platform/profile.env.example" &&
+       -x "$ROOT/scripts/vm/guest/$platform-adapter.sh" ]] ||
+      bad "$platform package adapter module missing"
+  fi
   metadata="$ADAPTER_STATE_DIR/$platform.json"
   if [[ -f "$metadata" ]] && jq -e --arg platform "$platform" '
     .platform == $platform and .last_validation_result == "ok" and

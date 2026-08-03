@@ -9,6 +9,77 @@ need qemu-img; need virt-install; need virsh; need sha256sum
 assert_provisioning_safe
 is_defined "$vm" && die "$(domain "$vm") already exists"
 
+if [[ "$vm" == umbrel ]]; then
+  [[ -f "$UMBREL_PROFILE" &&
+     "$(sha256sum "$UMBREL_PROFILE" | awk '{print $1}')" == "${UMBREL_PROFILE_SHA256,,}" ]] ||
+    die "pinned Umbrel profile is missing or invalid"
+  [[ -f "$UMBREL_ISO" && -f "$UMBREL_ISO.manifest.json" ]] ||
+    die "run 'bvml media-fetch umbrel' first"
+  [[ "$(sha256sum "$UMBREL_ISO" | awk '{print $1}')" == "${UMBREL_ISO_SHA256,,}" ]] ||
+    die "staged Umbrel installer digest mismatch"
+  jq -e --arg profile "${UMBREL_PROFILE_SHA256,,}" --arg sha "${UMBREL_ISO_SHA256,,}" \
+    --arg path "$UMBREL_ISO" '
+      .platform=="umbrel" and .profile_digest==$profile and
+      .sha256==$sha and .path==$path
+    ' "$UMBREL_ISO.manifest.json" >/dev/null ||
+    die "Umbrel installer generation manifest differs from active pinned inputs"
+  file "$UMBREL_ISO" | grep -qi 'ISO 9660' ||
+    die "staged Umbrel installer is not ISO9660"
+  xorriso -indev "$UMBREL_ISO" -pvd_info 2>&1 |
+    grep -Fq "Volume id    : '$(jq -r .os.iso_label "$UMBREL_PROFILE")'" ||
+    die "staged Umbrel installer volume identity mismatch"
+  vmdir="$(vm_dir umbrel)"
+  if [[ -d "$vmdir" ]] && find "$vmdir" -mindepth 1 -print -quit | grep -q .; then
+    die "partial Umbrel disk state exists; use create-cleanup after review"
+	  fi
+	  install -d -m 0750 "$vmdir"
+	  if command -v setfacl >/dev/null; then
+	    setfacl -m "u:$QEMU_USER:--x" "$vmdir" ||
+	      die "could not grant system QEMU traversal access to $vmdir"
+	  fi
+	  qemu-img create -f qcow2 "$vmdir/system.qcow2" "${UMBREL_SYSTEM_DISK_GIB}G"
+	  qemu-img create -f qcow2 "$vmdir/application.qcow2" "${APP_DISK_GIB}G"
+	  chmod 0660 "$vmdir"/*.qcow2
+	  if command -v setfacl >/dev/null; then
+	    setfacl -m "u:$QEMU_USER:rw-" "$vmdir"/*.qcow2 ||
+	      die "could not grant system QEMU access to Umbrel disks"
+	  fi
+	  sudo -u "$QEMU_USER" test -x "$vmdir" &&
+	    sudo -u "$QEMU_USER" test -r "$vmdir/system.qcow2" &&
+	    sudo -u "$QEMU_USER" test -w "$vmdir/system.qcow2" &&
+	    sudo -u "$QEMU_USER" test -r "$vmdir/application.qcow2" &&
+	    sudo -u "$QEMU_USER" test -w "$vmdir/application.qcow2" ||
+	    die "system QEMU cannot traverse and read/write the Umbrel VM storage"
+  boot=(); [[ "$BVML_BOOT_UEFI" == 1 ]] && boot=(--boot uefi)
+	  virt-install --connect "$LIBVIRT_URI" --name "$(domain umbrel)" \
+    --memory "$VM_MEMORY_MIB" --vcpus "$VM_CPUS" --cpu host-passthrough \
+    --virt-type kvm --os-variant generic "${boot[@]}" \
+	    --disk "path=$vmdir/system.qcow2,format=qcow2,bus=virtio,serial=$UMBREL_INSTALL_SERIAL,boot_order=2" \
+	    --disk "path=$vmdir/application.qcow2,format=qcow2,bus=virtio,serial=BVML-UMBREL-APP,boot_order=3" \
+	    --disk "path=$UMBREL_ISO,device=disk,bus=usb,readonly=on,serial=BVML-UMBREL-INST,boot_order=1" \
+    --network "network=$BVML_NETWORK,model=virtio" \
+    --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0 \
+    --graphics spice --video virtio --serial pty --noautoconsole --wait 0
+  "$BVML_ROOT/scripts/vm/umbrel-install.sh"
+	  installer_target="$(virshq domblklist "$(domain umbrel)" --details |
+	    awk -v source="$UMBREL_ISO" '$4==source {print $3; exit}')"
+	  [[ -n "$installer_target" ]] || die "installed VM has no identifiable installer attachment"
+	  virshq detach-disk "$(domain umbrel)" "$installer_target" --config
+	  [[ -z "$(virshq domblklist "$(domain umbrel)" --details |
+	    awk -v source="$UMBREL_ISO" '$4==source {print $3}')" ]] ||
+	    die "installer remains attached"
+  virshq start "$(domain umbrel)"
+  "$BVML_ROOT/scripts/vm/umbrel-onboard.sh"
+  virshq shutdown "$(domain umbrel)"
+  waited=0
+  while ! is_shut_off umbrel; do
+    (( waited < SHUTDOWN_TIMEOUT )) || die "Umbrel did not shut off after onboarding"
+    sleep 2; waited=$((waited+2))
+  done
+  note "created, installed, onboarded, and management-provisioned Umbrel VM"
+  return
+fi
+
 iso_var="${vm^^}_ISO"; sum_var="${vm^^}_ISO_SHA256"
 iso="${!iso_var:-}"; expected="${!sum_var:-}"
 

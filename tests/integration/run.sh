@@ -64,7 +64,28 @@ case "${1:-preflight}" in
     "$ROOT/bin/bvml" discard ubuntu
     assert_canonical_unchanged "$before"
     ;;
-  umbrel|startos)
+  umbrel)
+    before="$(canonical_fingerprint)"
+    if ! is_defined umbrel; then
+      "$ROOT/bin/bvml" media-fetch umbrel
+      "$ROOT/bin/bvml" create umbrel
+    fi
+    if ! jq -e '.platform=="umbrel" and .provisioning_result=="ok"' \
+      "$ADAPTER_STATE_DIR/umbrel.json" >/dev/null 2>&1; then
+      virshq start "$(domain umbrel)"
+      "$ROOT/bin/bvml" guest-provision umbrel
+      virshq shutdown "$(domain umbrel)"
+      for _ in $(seq 1 180); do is_shut_off umbrel && break; sleep 1; done
+      is_shut_off umbrel || die "Umbrel did not shut off after guest provisioning"
+    fi
+    "$ROOT/bin/bvml" start umbrel
+    "$ROOT/bin/bvml" adapter-setup umbrel
+    "$ROOT/bin/bvml" adapter-validate umbrel
+    "$ROOT/bin/bvml" stop umbrel
+    "$ROOT/bin/bvml" discard umbrel
+    assert_canonical_unchanged "$before"
+    ;;
+  startos)
     platform="$1"; before="$(canonical_fingerprint)"
     "$ROOT/bin/bvml" start "$platform" --adapter-setup
     "$ROOT/bin/bvml" adapter-setup "$platform"

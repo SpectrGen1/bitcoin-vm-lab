@@ -39,7 +39,8 @@ fi
 if [[ -f "$OVERLAY" || -f "$OVERLAY_META" ]]; then
   [[ -f "$OWNER_FILE" ]] && label=active || label=retained
   echo "overlay: $label vm=$(overlay_vm) id=$(overlay_id) generation=$(meta_get "$OVERLAY_META" checkpoint_generation)"
-  [[ -f "$OVERLAY" ]] && qemu-img info --backing-chain "$OVERLAY" 2>/dev/null | sed 's/^/  /'
+  [[ -f "$OVERLAY" ]] &&
+    qemu-img info --force-share --backing-chain "$OVERLAY" 2>/dev/null | sed 's/^/  /'
 else
   echo "overlay: absent"
 fi
@@ -51,6 +52,15 @@ for vm in ubuntu umbrel startos; do
   state=undefined; is_defined "$vm" && state="$(domain_state "$vm")"
   printf 'domain: %-13s state=%s\n' "$(domain "$vm")" "$state"
 done
+if [[ -f "$ADAPTER_STATE_DIR/umbrel.json" ]]; then
+  jq -r '"umbrel-adapter: profile=\(.profile_digest) os=\(.os_version) app=\(.package_version) provision=\(.provisioning_result // "unknown") validation=\(.last_validation_result)"' \
+    "$ADAPTER_STATE_DIR/umbrel.json"
+else
+  echo "umbrel-adapter: not provisioned"
+fi
+if [[ -f "$ADAPTER_RECOVERY_META" ]]; then
+  echo "umbrel-recovery: REQUIRED operation=$(meta_get "$ADAPTER_RECOVERY_META" operation) image=$(meta_get "$ADAPTER_RECOVERY_META" image)"
+fi
 
 echo "attachments:"
 attachments="$(all_attached_pairs)"
@@ -61,13 +71,16 @@ else
 fi
 
 errors="$(lifecycle_invariant_errors)"
+[[ ! -f "$ADAPTER_RECOVERY_META" ]] ||
+  errors="${errors}${errors:+$'\n'}Umbrel adapter recovery metadata requires app/mount/attachment reconciliation"
 if [[ -f "$CANONICAL" ]]; then
   if ! canonical_error="$(canonical_preflight 2>&1)"; then
     errors="${errors}${errors:+$'\n'}canonical preflight failed: ${canonical_error#*: }"
   fi
 fi
 if [[ -f "$OVERLAY" && -f "$OVERLAY_META" ]]; then
-  backing="$(qemu-img info --output=json "$OVERLAY" 2>/dev/null | jq -r '.["backing-filename"] // empty' 2>/dev/null || true)"
+  backing="$(qemu-img info --force-share --output=json "$OVERLAY" 2>/dev/null |
+    jq -r '.["backing-filename"] // empty' 2>/dev/null || true)"
   [[ "$backing" == "$CANONICAL" ]] ||
     errors="${errors}${errors:+$'\n'}overlay backing path is not the canonical checkpoint"
   [[ "$(meta_get "$OVERLAY_META" canonical_id)" == "$(canonical_id)" ]] ||
@@ -96,7 +109,7 @@ elif [[ -f "$OVERLAY" ]]; then
     echo "safety: discard or promotion preflight may proceed" ||
     echo "safety: discard preflight may proceed"
 elif [[ -f "$CANONICAL" ]]; then
-  echo "safety: Ubuntu start or rollback preflight may proceed; platform starts also require verified adapter metadata"
+  echo "safety: start/rollback preflight may proceed; Umbrel requires profile-bound provisioning and StartOS requires verified adapter metadata"
 else
   echo "safety: exactly one initialization path may begin"
 fi

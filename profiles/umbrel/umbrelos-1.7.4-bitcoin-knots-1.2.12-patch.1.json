@@ -1,0 +1,93 @@
+{
+  "profile_version": 1,
+  "profile_id": "umbrelos-1.7.4-bitcoin-knots-1.2.12-patch.1",
+  "adapter_implementation_version": "2",
+  "os": {
+    "version": "1.7.4",
+    "installer_url": "https://download.umbrel.com/release/1.7.4/umbrelos-amd64-usb-installer.iso",
+    "installer_sha256": "d30f4e495630b79e946cb6e98cc0f0404a72f69291df5debd7e8908bf106ac40",
+    "installer_size": 1843404800,
+    "iso_label": "UMBRELINSTALLER",
+    "installer_source_commit": "66d817ed00a77cca68a1a8d94dd56fe2b9fffb0d",
+    "installer_script_sha256": "3497be335140ae40370505af715385cf02d75bac359ff72e3cd1a37703c686f4",
+    "onboarding_routes_sha256": "3c4f3ecdf69a832e305859725f6693512591919a6c113cef3e92801a32204aee",
+    "identity": {
+      "id": "umbrel",
+      "version_id": "1.7.4"
+    },
+    "data_directory": "/home/umbrel/umbrel",
+    "installer_prompts": {
+      "banner": "umbrelOS USB Installer",
+      "warning": "Installing umbrelOS will wipe your entire storage device.",
+      "select": "Select a storage device by number to install umbrelOS on:",
+      "selected": "installing umbrelOS on:",
+      "complete": "umbrelOS has been installed!",
+      "shutdown": "Press any key to shutdown, remember to remove the USB drive before turning the device back on."
+    }
+  },
+  "app_store": {
+    "commit": "3e3f6760e1358e5aaa782020eb52df2d0021ce90",
+    "app_id": "bitcoin-knots",
+    "manifest_version": "1.1",
+    "app_version": "1.2.12-patch.1",
+    "files": {
+      "umbrel-app.yml": "522b8bb18fce6b33b9f8b6e78c2bdac4e15728a0407a41a1c0bf0781c9e03ce9",
+      "docker-compose.yml": "7f21461291c02c076cc04593a3749758f13b9c4fc6662c2218110657e2b18f57",
+      "exports.sh": "47f7470e66ff45b54f7fb6431319ece5e9b60e41891f7d8b7580af11e8449ddf",
+      "hooks/pre-start": "3c47397903987d71495e62d4523e3f9560b504bb513bc4e5a21f5ac03c2b45d4"
+    },
+    "installed_files": {
+      "umbrel-app.yml": "522b8bb18fce6b33b9f8b6e78c2bdac4e15728a0407a41a1c0bf0781c9e03ce9",
+      "docker-compose.yml": "bd5d050797e5b3dc6a502d3460fd88db8a9b42bfc3c57f71fdee3ec50ed8edd9",
+      "exports.sh": "47f7470e66ff45b54f7fb6431319ece5e9b60e41891f7d8b7580af11e8449ddf",
+      "hooks/pre-start": "5e67a30b1ae2f3e1869c58c6355999b13076f78fe02a092e4c15370a8a7ba1f4"
+    },
+    "host_datadir_suffix": "app-data/bitcoin-knots/data/bitcoin",
+    "container_datadir": "/data/bitcoin",
+    "compose_project": "bitcoin-knots",
+    "compose_service": "app",
+    "network_mode": "umbrel_main_network",
+    "published_ports": [9332, 9333],
+    "runtime_uid": 1000,
+    "runtime_gid": 1000,
+    "restart_policy": "on-failure",
+    "stop_grace_period_ns": 930000000000,
+    "image": "ghcr.io/retropex/umbrel-bitcoin-knots:1.2.12@sha256:498a54d5e65acce0ccc5c1881534033bb0f10939e8a371ef17dcf4409a56e891",
+    "image_index_digest": "sha256:498a54d5e65acce0ccc5c1881534033bb0f10939e8a371ef17dcf4409a56e891",
+    "image_amd64_digest": "sha256:93fb25c2ae26b550fb97a3f0e92cb7d36f684208817858973ddd3427dd5b7285",
+    "entrypoint": ["docker-entrypoint.sh"],
+    "command": ["node", "dist/server.js"],
+    "tor_image": "ghcr.io/getumbrel/tor:0.4.9.11@sha256:e382b8629c0dfef6ceb396b062622d4e4e955b19d6f16b883fd2c0723ad5671a",
+    "i2p_image": "purplei2p/i2pd:release-2.59.0@sha256:257653c18ce0b127ef480e3d8373b3ddbf1495e842674c8cfc59909be0015979"
+  },
+  "knots": {
+    "version": "v29.3.knots20260508",
+    "executable": "/opt/bitcoind/v29.3.knots20260508/bitcoind",
+    "binary_sha256": "2e6d7a8c9c199c710aa43226e869b02ee5a9c448a67b41b602ca0a329b326e30",
+    "settings_schema_sha256": "ebd28442e21f7c8f9064c129a32cc282380636c8855472b33aff428344080114",
+    "settings_metadata_sha256": "977d51ef40b5b1936f7905b1f4329c4ddfd20f68a2bb20152ab67e352003ca1f",
+    "required_settings": {
+      "chain": "main",
+      "version": "v29.3.knots20260508",
+      "consensusrules": true,
+      "prune": 0,
+      "txindex": false,
+      "blockfilterindex": false,
+      "peerblockfilters": false
+    },
+    "required_generated_config": {
+      "consensusrules": "rdts"
+    },
+    "base_config": ["blocksxor=0"],
+    "checkpoint_profile_id": "mainnet-no-indexes-v1",
+    "checkpoint_profile_sha256": "6d99ab029148f9bcb19d10abf7270ef3d2c8f7b4ae022c9e3ac81122ca6b03fa",
+    "required_indexes": []
+  },
+  "runtime": {
+    "device": "/dev/vdc",
+    "container_datadir": "/data/bitcoin",
+    "required_sidecars": ["tor", "i2pd_daemon"],
+    "required_zmq_ports": [48332, 48333, 48334, 48335, 48336],
+    "max_tip_age_seconds": 86400
+  }
+}

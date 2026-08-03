@@ -5,6 +5,10 @@ cmd="${1:-help}"; shift || true
 case "$cmd" in
   host-setup) exec "$ROOT/scripts/host/setup-gentoo.sh" "$@" ;;
   host-validate) exec "$ROOT/scripts/host/validate-gentoo.sh" "$@" ;;
+  credentials-init)
+    [[ "${1:-}" == umbrel && $# == 1 ]] || { echo "usage: bvml credentials-init umbrel" >&2; exit 64; }
+    shift
+    exec "$ROOT/scripts/umbrel-credentials-init.sh" "$@" ;;
   media-fetch|profiles-install|storage-prepare|guest-provision|guest-repair)
     exec "$ROOT/scripts/provision.sh" "$cmd" "$@" ;;
   create-cleanup) exec "$ROOT/scripts/vm/create-cleanup.sh" "$@" ;;
@@ -17,17 +21,19 @@ case "$cmd" in
 Commands:
   host-validate                  verify KVM, libvirt, UEFI, and storage access
   host-setup                     install/configure minimal Gentoo prerequisites
+  credentials-init umbrel        generate protected onboarding credentials and SSH key
   init                           initialize system-libvirt storage
-  media-fetch ubuntu             stage a digest-pinned Ubuntu cloud image
+  media-fetch {ubuntu|umbrel}    stage and structurally verify pinned media
   profiles-install              verify/install signed Knots and RDTS profiles
   storage-prepare               initialize storage and verify QEMU traversal
   create VM                      create a persistent VM from a verified ISO
                                  or unattended pinned Ubuntu cloud image
   create-cleanup VM --confirm-remove-partial
                                  remove only known disks from a failed undefined VM creation
-  guest-provision ubuntu         install verified guest assets through QGA
+  guest-provision {ubuntu|umbrel}
+                                 provision verified guest assets/native app
                                  (refuses any active Bitcoin lifecycle)
-  guest-repair ubuntu --scripts-only
+  guest-repair {ubuntu|umbrel} --scripts-only
                                  update lifecycle scripts only after proving
                                  guest profile digests remain unchanged
   checkpoint-bootstrap           create/attach empty fresh-IBD disk to Ubuntu
