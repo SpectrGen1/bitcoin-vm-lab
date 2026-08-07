@@ -228,17 +228,27 @@ mount_overlay() {
     fail "Fulcrum overlay did not propagate into its package LXC"
 }
 
+apply_signet_fulcrum_contract() {
+  local conf="$PRIVATE/fulcrum.conf"
+  [[ -f "$conf" ]] || fail "Fulcrum configuration missing at $conf"
+  chattr -i "$conf" 2>/dev/null || true
+  sed -i -E '/^[[:space:]]*(datadir|network)[[:space:]]*=/d' "$conf"
+  printf '\n# bitcoin-vm-lab consumer contract\ndatadir=/data\nnetwork=signet\n' >>"$conf"
+  grep -Eqi '^[[:space:]]*network[[:space:]]*=[[:space:]]*signet([[:space:]]|$)' "$conf" ||
+    fail "failed to pin Fulcrum network=signet"
+  chattr +i "$conf" 2>/dev/null || true
+}
+
 seed_overlay() {
   local db layout
   layout="$(iget .fulcrum.database_layout)"
   db="$PRIVATE/$layout"
   [[ -d "$db" && -n "$(find "$db" -mindepth 1 -print -quit)" ]] ||
     fail "StartOS Fulcrum overlay lacks reusable database at $db (base was not attached)"
+  chattr -i "$PRIVATE/fulcrum.conf" 2>/dev/null || true
   install -m 0600 "$SEED/fulcrum.conf" "$PRIVATE/fulcrum.conf"
   install -m 0600 "$SEED/store.json" "$PRIVATE/store.json"
-  sed -i -E '/^[[:space:]]*(datadir|network)[[:space:]]*=/d' "$PRIVATE/fulcrum.conf"
-  printf '\n# bitcoin-vm-lab consumer contract\ndatadir=/data\nnetwork=signet\n' \
-    >>"$PRIVATE/fulcrum.conf"
+  apply_signet_fulcrum_contract
   jq --arg db "$db" --arg layout "$layout" \
     '.services.fulcrum + {startos_index_profile_sha256:"'"$INDEX_SHA"'",
       database_path:$db,database_layout:$layout,reused_existing_database:true}' \
@@ -342,22 +352,33 @@ setup() {
   # --force: allow start while a prior critical task (e.g. bitcoind txindex
   # verification) is still recorded; runtime verify still requires Electrum OK.
   start-cli package start "$PACKAGE" --force; wait_status running
+  if ! grep -Eqi '^[[:space:]]*network[[:space:]]*=[[:space:]]*signet([[:space:]]|$)' \
+       "$PRIVATE/fulcrum.conf" 2>/dev/null; then
+    apply_signet_fulcrum_contract
+    start-cli package restart "$PACKAGE" --force 2>/dev/null ||
+      start-cli package restart "$PACKAGE"
+    wait_status running
+  fi
+  apply_signet_fulcrum_contract
   local waited=0
   while ! ( verify_runtime >/dev/null 2>"$STATE/fulcrum-verify.err" ); do
     if ! (( waited < TIMEOUT )); then
       cat "$STATE/fulcrum-verify.err" >&2
       fail "StartOS Fulcrum did not synchronize"
     fi
+    apply_signet_fulcrum_contract
     sleep 10; waited=$((waited+10))
   done
   start-cli package restart "$PACKAGE" --force 2>/dev/null || start-cli package restart "$PACKAGE"
   wait_status running
+  apply_signet_fulcrum_contract
   waited=0
   while ! ( verify_runtime >/dev/null 2>"$STATE/fulcrum-verify.err" ); do
     if ! (( waited < TIMEOUT )); then
       cat "$STATE/fulcrum-verify.err" >&2
       fail "StartOS Fulcrum did not stay ready after restart"
     fi
+    apply_signet_fulcrum_contract
     sleep 10; waited=$((waited+10))
   done
   verify_runtime

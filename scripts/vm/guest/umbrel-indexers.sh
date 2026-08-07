@@ -348,11 +348,12 @@ verify_runtime() {
     --filter label=com.docker.compose.service=app)"
   [[ "$(wc -w <<<"$knots_cid")" == 1 ]] ||
     fail "Umbrel bitcoin-knots service container is not unique"
-  # Knots listens on 9332 (not Core's 8332). Prefer live exports, then default.
+  # Knots keeps custom port 9332 on signet; cookie lives under signet/.
   knots_rpc_port="${APP_BITCOIN_KNOTS_RPC_PORT:-${APP_BITCOIN_RPC_PORT:-9332}}"
   [[ "$knots_rpc_port" =~ ^[0-9]+$ ]] || knots_rpc_port=9332
   node_height="$(docker exec "$knots_cid" bitcoin-cli \
-    -datadir=/data/bitcoin -rpcport="$knots_rpc_port" getblockcount 2>/dev/null || true)"
+    -datadir=/data/bitcoin -chain=signet -rpcport="$knots_rpc_port" \
+    -rpccookiefile=/data/bitcoin/signet/.cookie getblockcount 2>/dev/null || true)"
   [[ "$node_height" =~ ^[0-9]+$ ]] ||
     fail "Umbrel Knots RPC did not return a block height (rpcport=$knots_rpc_port)"
   if ! (( node_height - height >= 0 && node_height - height <= 1 )); then

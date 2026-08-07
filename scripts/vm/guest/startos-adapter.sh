@@ -352,11 +352,11 @@ apply_signet_conf_contract() {
   # Drop managed keys and any existing network section headers/content markers.
   sed -i -E \
     -e '/^[[:space:]]*\[(main|test|signet|regtest)\][[:space:]]*$/d' \
-    -e '/^[[:space:]]*(blocksxor|prune|reindex|reindex-chainstate|txindex|chain|signet|testnet|regtest|bind|rpcbind|whitebind|port|rpcport)[[:space:]]*=/d' \
+    -e '/^[[:space:]]*(blocksxor|prune|reindex|reindex-chainstate|txindex|chain|signet|testnet|regtest|bind|rpcbind|whitebind|port|rpcport|checkblocks|checklevel)[[:space:]]*=/d' \
     "$conf"
-  # checkblocks=0 avoids a multi-minute verify that StartOS health checks treat
-  # as a crash and restart-loop on this lab hardware.
-  printf '\n# bitcoin-vm-lab consumer contract\nchain=signet\nblocksxor=0\nprune=0\ncheckblocks=0\n' >>"$conf"
+  # checkblocks=1 / checklevel=0 avoid multi-minute startup verifies that the
+  # official StartOS package health checks treat as failure and restart-loop.
+  printf '\n# bitcoin-vm-lab consumer contract\nchain=signet\nblocksxor=0\nprune=0\ncheckblocks=1\nchecklevel=0\n' >>"$conf"
   if jq -e '.checkpoint.required_indexes | index("txindex") != null' "$PROFILE" >/dev/null; then
     printf 'txindex=1\n' >>"$conf"
   else
@@ -369,6 +369,42 @@ apply_signet_conf_contract() {
     # Match StartOS seed defaults if the package wiped them.
     printf 'bind=0.0.0.0:8333\nrpcbind=0.0.0.0:8332\nwhitebind=0.0.0.0:8334\n' >>"$conf"
   fi
+}
+
+# Official bitcoind package entrypoint waits for $datadir/.cookie (mainnet path).
+# With chain=signet the cookie is only created at $datadir/signet/.cookie, so the
+# package never becomes healthy and SIGTERM-restarts in a tight loop. Alias the
+# signet cookie at the mainnet path the entrypoint expects.
+# Returns 0 when alias exists, 1 when the signet cookie is not ready yet.
+ensure_signet_rpc_cookie_alias() {
+  local datadir="$PRIVATE_MOUNT"
+  if ! mountpoint -q "$datadir" 2>/dev/null; then
+    datadir="${LXC_VOLUME_SOURCE:-}"
+  fi
+  [[ -n "$datadir" && -d "$datadir" ]] || return 1
+  [[ -f "$datadir/signet/.cookie" ]] || return 1
+  # Prefer a relative symlink. Some idmapped package mounts reject symlink
+  # creation ("Value too large for defined data type"); fall back to a copy.
+  if ! ln -sfn signet/.cookie "$datadir/.cookie" 2>/dev/null; then
+    cp -a -- "$datadir/signet/.cookie" "$datadir/.cookie" 2>/dev/null || return 1
+  fi
+  # Also alias inside the running subcontainer view when attach works.
+  sub_exec sh -c '
+    if [ -f /root/.bitcoin/signet/.cookie ]; then
+      ln -sfn signet/.cookie /root/.bitcoin/.cookie 2>/dev/null ||
+        cp -a /root/.bitcoin/signet/.cookie /root/.bitcoin/.cookie
+    fi
+  ' >/dev/null 2>&1 || true
+  return 0
+}
+
+wait_signet_rpc_cookie_alias() {
+  local waited=0
+  while ! ensure_signet_rpc_cookie_alias; do
+    (( waited < 600 )) || fail "signet RPC cookie alias could not be established for StartOS health checks"
+    sleep 1
+    waited=$((waited + 1))
+  done
 }
 
 merge_config() {
@@ -475,6 +511,7 @@ rpc() {
 wait_node_ready() {
   local waited=0 chain
   while :; do
+    ensure_signet_rpc_cookie_alias 2>/dev/null || true
     chain="$(rpc getblockchaininfo 2>/dev/null || true)"
     chain="${chain//$'\r'/}"
     if jq -e '.chain=="signet" and .initialblockdownload==false and .blocks==.headers' \
@@ -624,6 +661,7 @@ setup() {
   start-cli package start "$PACKAGE_ID" --force 2>/dev/null ||
     start-cli package start "$PACKAGE_ID"
   wait_package_running
+  wait_signet_rpc_cookie_alias
   # If package start still rewrote via a different path, re-apply and bounce.
   if ! grep -Eq '^[[:space:]]*chain[[:space:]]*=[[:space:]]*signet' "$PRIVATE_MOUNT/bitcoin.conf" ||
      grep -Eq '^[[:space:]]*(bind|rpcbind)[[:space:]]*=' "$PRIVATE_MOUNT/bitcoin.conf"; then
@@ -632,9 +670,11 @@ setup() {
     chown --reference="$SEED/bitcoin.conf" "$PRIVATE_MOUNT/bitcoin.conf" 2>/dev/null || true
     chattr +i "$PRIVATE_MOUNT/bitcoin.conf" 2>/dev/null || true
     restart_package_observed
+    wait_signet_rpc_cookie_alias
   fi
   verify_runtime
   restart_package_observed
+  wait_signet_rpc_cookie_alias
   verify_runtime
 }
 

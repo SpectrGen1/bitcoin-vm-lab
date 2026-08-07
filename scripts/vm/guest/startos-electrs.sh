@@ -224,6 +224,15 @@ mount_overlay() {
     fail "Electrs overlay did not propagate into its package LXC"
 }
 
+# Official StartOS Electrs (community package 0.11.1:17) hard-codes
+# network=bitcoin in package store and rewrites electrs.toml on every start.
+# Signet/testnet are not supported by the package (see electrs-startos README:
+# "Mainnet only — network is fixed to bitcoin"). Lab signet consumers therefore
+# cannot prove Electrs overlay reuse through start-cli on this package version.
+assert_startos_electrs_signet_supported() {
+  fail "official StartOS Electrs package ${PACKAGE_VERSION} is mainnet-only (network fixed to bitcoin); signet index overlay reuse is unsupported until the package exposes signet"
+}
+
 seed_overlay() {
   local db layout
   layout="$(iget .electrs.database_layout)"
@@ -234,19 +243,12 @@ seed_overlay() {
   if [[ -f "$SEED/store.json" ]]; then
     install -m 0600 "$SEED/store.json" "$PRIVATE/store.json"
   fi
-  # Force signet network if the package TOML exposes a network key.
-  if grep -Eq '^[[:space:]]*network[[:space:]]*=' "$PRIVATE/electrs.toml" 2>/dev/null; then
-    sed -i -E 's/^[[:space:]]*network[[:space:]]*=.*/network = "signet"/' \
-      "$PRIVATE/electrs.toml"
-  else
-    printf '\n# bitcoin-vm-lab consumer contract\nnetwork = "signet"\n' \
-      >>"$PRIVATE/electrs.toml"
-  fi
   # Cookie for signet lives under the network subdir of the bitcoind datadir.
   jq --arg db "$db" --arg layout "$layout" \
     '.services.electrs + {startos_index_profile_sha256:"'"$INDEX_SHA"'",
       database_path:$db,database_layout:$layout,reused_existing_database:true}' \
     "$ACTIVE" >"$PRIVATE/.bvml-index-overlay.json"
+  assert_startos_electrs_signet_supported
 }
 
 runtime_json() {
@@ -330,28 +332,9 @@ verify_runtime() {
 }
 
 setup() {
-  load_profiles; package_stopped || { start-cli package stop "$PACKAGE"; wait_status stopped; }
-  mount_overlay; seed_overlay
-  start-cli package start "$PACKAGE" --force; wait_status running
-  local waited=0
-  while ! ( verify_runtime >/dev/null 2>"$STATE/electrs-verify.err" ); do
-    if ! (( waited < TIMEOUT )); then
-      cat "$STATE/electrs-verify.err" >&2
-      fail "StartOS Electrs did not synchronize"
-    fi
-    sleep 10; waited=$((waited+10))
-  done
-  start-cli package restart "$PACKAGE" --force 2>/dev/null || start-cli package restart "$PACKAGE"
-  wait_status running
-  waited=0
-  while ! ( verify_runtime >/dev/null 2>"$STATE/electrs-verify.err" ); do
-    if ! (( waited < TIMEOUT )); then
-      cat "$STATE/electrs-verify.err" >&2
-      fail "StartOS Electrs did not stay ready after restart"
-    fi
-    sleep 10; waited=$((waited+10))
-  done
-  verify_runtime
+  load_profiles
+  # Fail closed before mount/start: official package cannot open db/signet.
+  assert_startos_electrs_signet_supported
 }
 
 stop_all() {
