@@ -89,7 +89,7 @@ verify_container_knots() {
   [[ "$digest" == "$expected_digest" ]] || adapter_fail "in-container executable digest mismatch"
   uid="$("$runtime" exec "$container" stat -c %u "/proc/$pid")"
   [[ "$uid" == "$expected_user" ]] || adapter_fail "Knots runtime user $uid does not match expected $expected_user"
-  for expected in "-datadir=$datadir" "-chain=main" "-blocksxor=0"; do
+  for expected in "-datadir=$datadir" "-chain=signet" "-blocksxor=0"; do
     option="${expected%%=*}"
     count="$(jq --arg o "$option" '[.[] | select(. == $o or startswith($o + "="))] | length' <<<"$args")"
     [[ "$count" == 1 ]] || adapter_fail "live Knots process has missing/duplicated $option"

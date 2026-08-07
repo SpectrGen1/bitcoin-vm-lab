@@ -31,7 +31,7 @@ load_profile() {
     .profile_version == 1 and .app_store.app_id == "bitcoin-knots" and
     .app_store.host_datadir_suffix == "app-data/bitcoin-knots/data/bitcoin" and
     .app_store.container_datadir == "/data/bitcoin" and
-    .knots.required_settings.chain == "main" and
+    .knots.required_settings.chain == "signet" and
     .knots.required_settings.consensusrules == true and
     .knots.required_settings.prune == 0
   ' "$PROFILE" >/dev/null || fail "unsupported or unsafe Umbrel profile"
@@ -249,7 +249,7 @@ wait_checkpoint_ready() {
       indexes="$(docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
         "-rpcport=$APP_BITCOIN_KNOTS_RPC_PORT" getindexinfo 2>/dev/null || true)"
       if jq -e --argjson minimum "$(jq -r .expected_minimum_height "$ACTIVE")" '
-          .chain=="main" and .initialblockdownload==false and
+          .chain=="signet" and .initialblockdownload==false and
           .blocks==.headers and .blocks >= $minimum
         ' <<<"$chain" >/dev/null 2>&1 &&
         jq -e --argjson expected "$(jq '.knots.required_indexes' "$PROFILE")" \
@@ -351,8 +351,8 @@ mount_overlay() {
   install -d -o root -g root -m 0700 "$DATADIR"
   mount -o rw,nodev,nosuid "$DEVICE" "$DATADIR"
   chown 1000:1000 "$DATADIR"
-  [[ -d "$DATADIR/blocks" && -d "$DATADIR/chainstate" ]] ||
-    fail "mounted checkpoint lacks blocks or chainstate"
+  [[ -d "$DATADIR/signet/blocks" && -d "$DATADIR/signet/chainstate" ]] ||
+    fail "mounted checkpoint lacks signet/blocks or signet/chainstate"
   jq -n --argjson active "$(cat "$ACTIVE")" --arg profile "$PROFILE_SHA" \
     '$active + {umbrel_profile_sha256:$profile}' >"$DATADIR/.bvml-overlay.json"
   chown 1000:1000 "$DATADIR/.bvml-overlay.json"
@@ -411,8 +411,9 @@ verify_runtime() {
   args="$(docker exec "$cid" sh -ceu 'tr "\0" "\n" <"/proc/$1/cmdline"' sh "$pid" | jq -Rsc 'split("\n")[:-1]')"
   jq -e --arg d "$CONTAINER_DATADIR" '
     any(.[];.=="-datadir="+$d) and
-    (any(.[];.=="-chain=main") or (all(.[];. != "-chain=test" and . != "-testnet" and . != "-regtest" and . != "-signet")))
-  ' <<<"$args" >/dev/null || fail "live Knots process does not use mainnet and /data/bitcoin"
+    (any(.[];.=="-chain=signet" or .=="-signet") or
+      (all(.[];. != "-chain=main" and . != "-chain=test" and . != "-testnet" and . != "-regtest")))
+  ' <<<"$args" >/dev/null || fail "live Knots process does not use signet and /data/bitcoin"
   jq -e 'all(.[]; (startswith("-reindex") or startswith("-reindex-chainstate"))|not)' \
     <<<"$args" >/dev/null || fail "live Knots unexpectedly requests a reindex"
   digest="$(docker exec "$cid" sha256sum "$KNOTS_EXE" | awk '{print $1}')"
@@ -431,9 +432,9 @@ verify_runtime() {
   grep -Eq '^consensusrules=rdts$' <<<"$config" || fail "RDTS is absent from generated configuration"
   docker exec "$cid" grep -Eq '^blocksxor=0$' "$CONTAINER_DATADIR/bitcoin.conf" ||
     fail "blocksxor=0 is absent from base configuration"
-  if docker exec "$cid" test -s "$CONTAINER_DATADIR/blocks/xor.dat"; then
+  if docker exec "$cid" test -s "$CONTAINER_DATADIR/signet/blocks/xor.dat"; then
     docker exec "$cid" sh -ceu '
-      ! od -An -v -tu1 "$1/blocks/xor.dat" | tr -s " " "\n" | sed "/^$/d" | grep -qv "^0$"
+      ! od -An -v -tu1 "$1/signet/blocks/xor.dat" | tr -s " " "\n" | sed "/^$/d" | grep -qv "^0$"
     ' sh "$CONTAINER_DATADIR" || fail "block storage is XOR encoded"
   fi
   chain="$(docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
@@ -443,8 +444,8 @@ verify_runtime() {
     fail "startup logs do not prove the effective RDTS configuration"
   ! grep -Eqi 'Reindexing|Rebuilding chainstate' <<<"$logs" ||
     fail "Knots entered reindex or chainstate rebuild"
-  jq -e '.chain=="main" and .initialblockdownload==false and .blocks==.headers' <<<"$chain" >/dev/null ||
-    fail "Knots is not fully synchronized on mainnet"
+  jq -e '.chain=="signet" and .initialblockdownload==false and .blocks==.headers' <<<"$chain" >/dev/null ||
+    fail "Knots is not fully synchronized on signet"
   [[ "$(jq -r .blocks <<<"$chain")" -ge "$(jq -r .expected_minimum_height "$ACTIVE")" ]] ||
     fail "Knots did not open the checkpoint's existing chain height"
   now="$(date +%s)"; tip_age=$((now - $(jq -r .time <<<"$chain")))

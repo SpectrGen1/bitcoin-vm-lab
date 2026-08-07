@@ -156,11 +156,11 @@ ConditionPathIsMountPoint=$target
 [Service]
 ExecStartPre=-/usr/bin/docker rm -f $container
 ExecStart=/usr/bin/docker run --rm --name $container --network host \
-  -e ELECTRS_LOG_FILTERS=INFO -e ELECTRS_NETWORK=bitcoin \
-  -e ELECTRS_DAEMON_RPC_ADDR=127.0.0.1:8332 \
-  -e ELECTRS_DAEMON_P2P_ADDR=127.0.0.1:8333 \
+  -e ELECTRS_LOG_FILTERS=INFO -e ELECTRS_NETWORK=signet \
+  -e ELECTRS_DAEMON_RPC_ADDR=127.0.0.1:38332 \
+  -e ELECTRS_DAEMON_P2P_ADDR=127.0.0.1:38333 \
   -e ELECTRS_ELECTRUM_RPC_ADDR=127.0.0.1:50001 \
-  -e ELECTRS_COOKIE_FILE=/data/.bitcoin/.cookie \
+  -e ELECTRS_COOKIE_FILE=/data/.bitcoin/signet/.cookie \
   -e ELECTRS_DB_DIR=/data/db \
   -v $BITCOIN:/data/.bitcoin:ro -v $target:/data:rw $image
 ExecStop=/usr/bin/docker stop --time 300 $container
@@ -172,16 +172,17 @@ EOF
   else
     cat >"$target/fulcrum.conf" <<EOF
 datadir = /data
-bitcoind = 127.0.0.1:8332
-rpccookie = /bitcoin/.cookie
+network = signet
+bitcoind = 127.0.0.1:38332
+rpccookie = /bitcoin/signet/.cookie
 tcp = 127.0.0.1:50002
 admin = 127.0.0.1:8000
 peering = false
 announce = false
-# Lab-tuned for mainnet indexing on a 32GiB / multi-vCPU Ubuntu VM.
-db_mem = 8192
-worker_threads = 8
-bitcoind_clients = 8
+# Lab-tuned for signet indexing.
+db_mem = 2048
+worker_threads = 4
+bitcoind_clients = 4
 bitcoind_timeout = 600
 EOF
     chown 1000:1000 "$target/fulcrum.conf"
@@ -243,7 +244,7 @@ index_database_path() {
   layout="$(jq -r --arg s "$service" '.[$s].database_layout // empty' "$PROFILE")"
   if [[ -z "$layout" || "$layout" == null ]]; then
     case "$service" in
-      electrs) layout=db/bitcoin ;;
+      electrs) layout=db/signet ;;
       fulcrum) layout=fulc2_db ;;
     esac
   fi
@@ -323,7 +324,7 @@ verify_service() {
       (( height + 2 >= base_height )) ||
         fail "$service consumer height $height is below protected base tip $base_height"
     else
-      (( height > 100000 )) ||
+      (( height > 1000 )) ||
         fail "$service consumer height $height is too low to prove base reuse"
     fi
   fi

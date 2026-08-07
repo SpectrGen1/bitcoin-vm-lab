@@ -52,7 +52,7 @@ accept_umbrel_sync_pending() {
   [[ "$operation" == adapter-setup || "$operation" == adapter-verify ]] ||
     die "Umbrel setup failed outside the expected synchronization gates"
   platform_exec_sync umbrel "$script" 120 prepared
-  jq -e '.prepared==true and .blockchain.chain=="main"' <<<"$GUEST_EXEC_STDOUT" >/dev/null ||
+  jq -e '.prepared==true and .blockchain.chain=="signet"' <<<"$GUEST_EXEC_STDOUT" >/dev/null ||
     die "Umbrel setup failure did not leave a profile-verified running Knots process"
 }
 

@@ -366,7 +366,7 @@ verify_runtime() {
       fail "$service height $height is below protected base tip $base_height (reindex suspected)"
     fi
   else
-    if ! (( height > 100000 )); then
+    if ! (( height > 1000 )); then
       fail "$service height $height is too low to prove Umbrel base reuse"
     fi
   fi

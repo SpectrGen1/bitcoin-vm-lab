@@ -89,7 +89,7 @@ Commands:
                                  install completed bootstrap as first checkpoint
   bootstrap-cleanup              remove an interrupted, inactive bootstrap
   bootstrap-status               report fresh-IBD/bootstrap lifecycle state
-  checkpoint-import SOURCE (--assert-source-stopped|--consistent-snapshot) --assert-mainnet
+  checkpoint-import SOURCE (--assert-source-stopped|--consistent-snapshot) --assert-signet
                                  optionally import a compatible explicit source
   checkpoint-sync-start          configure/start Ubuntu Knots on its update overlay
   checkpoint-profile-migrate-guest

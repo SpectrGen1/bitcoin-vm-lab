@@ -36,7 +36,7 @@ load_profile() {
     and .package.lxc_volume_mount=="/media/startos/volumes/main"
     and .package.subcontainer=="bitcoind-sub"
     and .package.subcontainer_datadir=="/root/.bitcoin"
-    and .checkpoint.network=="main"
+    and .checkpoint.network=="signet"
     and .checkpoint.blocksxor==0
     and .checkpoint.prune==0
     and (.checkpoint.required_indexes|type=="array")
@@ -257,7 +257,8 @@ capture_seed() {
       fail "native StartOS volume lacks required seed $file"
     install -o root -g root -m 0600 "$LXC_VOLUME_SOURCE/$file" "$SEED/$file"
   done
-  [[ ! -e "$LXC_VOLUME_SOURCE/blocks" && ! -e "$LXC_VOLUME_SOURCE/chainstate" ]] ||
+  [[ ! -e "$LXC_VOLUME_SOURCE/blocks" && ! -e "$LXC_VOLUME_SOURCE/chainstate" &&
+     ! -e "$LXC_VOLUME_SOURCE/signet/blocks" && ! -e "$LXC_VOLUME_SOURCE/signet/chainstate" ]] ||
     fail "native StartOS seed unexpectedly contains blockchain data"
   local native_bytes
   native_bytes="$(du -sx -B1 "$LXC_VOLUME_SOURCE" | awk '{print $1}')"
@@ -350,8 +351,8 @@ merge_config() {
   install -m 0600 "$SEED/store.json" "$store"
   find "$LXC_VOLUME_SOURCE" -maxdepth 1 -type f \
     \( -name '.cookie' -o -name '*.pid' -o -name '.lock' \) -delete
-  sed -i -E '/^[[:space:]]*(blocksxor|prune|reindex|reindex-chainstate|txindex)[[:space:]]*=/d' "$conf"
-  printf '\n# bitcoin-vm-lab consumer contract\nblocksxor=0\nprune=0\n' >>"$conf"
+  sed -i -E '/^[[:space:]]*(blocksxor|prune|reindex|reindex-chainstate|txindex|chain|signet|testnet|regtest)[[:space:]]*=/d' "$conf"
+  printf '\n# bitcoin-vm-lab consumer contract\nchain=signet\nblocksxor=0\nprune=0\n' >>"$conf"
   if jq -e '.checkpoint.required_indexes | index("txindex") != null' "$PROFILE" >/dev/null; then
     printf 'txindex=1\n' >>"$conf"
   else
@@ -449,7 +450,7 @@ wait_node_ready() {
   while :; do
     chain="$(rpc getblockchaininfo 2>/dev/null || true)"
     chain="${chain//$'\r'/}"
-    if jq -e '.chain=="main" and .initialblockdownload==false and .blocks==.headers' \
+    if jq -e '.chain=="signet" and .initialblockdownload==false and .blocks==.headers' \
       <<<"$chain" >/dev/null 2>&1; then
       printf '%s\n' "$chain"
       return 0
@@ -515,16 +516,21 @@ verify_runtime() {
     fail "official Knots executable digest mismatch"
   [[ "$(jq -r .version <<<"$runtime")" == "$(jqv .package.knots_version_normalized)" ]] ||
     fail "actual Knots version differs from the pinned package"
+  # Network may be set via conf (chain=signet) rather than CLI; forbid other nets
+  # and reindex flags. Runtime getblockchaininfo proves signet below.
   jq -e --arg datadir "$DATADIR" '
     ([.args[] | select(startswith("-datadir="))] | all(. == "-datadir="+$datadir)) and
-    ([.args[] | select(test("^-(testnet|regtest|signet|reindex|reindex-chainstate)(=|$)"))] | length==0)
+    ([.args[] | select(test("^-(testnet|regtest)(=|$)"))] | length==0) and
+    ([.args[] | select(test("^-(reindex|reindex-chainstate)(=|$)"))] | length==0)
   ' <<<"$runtime" >/dev/null ||
     fail "actual official Knots process uses a conflicting datadir/network/reindex argument"
+  grep -Eq '^[[:space:]]*chain[[:space:]]*=[[:space:]]*signet([[:space:]]|$)' \
+    "$PRIVATE_MOUNT/bitcoin.conf" || fail "chain=signet is not effective in StartOS configuration"
   chain="$(wait_node_ready)"
   indexes="$(wait_indexes_ready)"
   deployment="$(rpc getdeploymentinfo)"
-  jq -e '.chain=="main" and .initialblockdownload==false and .blocks==.headers' <<<"$chain" >/dev/null ||
-    fail "StartOS Knots is not synchronized on mainnet"
+  jq -e '.chain=="signet" and .initialblockdownload==false and .blocks==.headers' <<<"$chain" >/dev/null ||
+    fail "StartOS Knots is not synchronized on signet"
   jq -e --arg name "$(jqv .package.rdts_deployment)" '
     .deployments[$name] as $deployment |
     $deployment.type=="bip9" and

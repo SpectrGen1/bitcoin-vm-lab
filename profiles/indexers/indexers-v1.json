@@ -1,14 +1,14 @@
 {
   "profile_version": 1,
-  "profile_id": "indexers-mainnet-v1",
-  "bitcoin_checkpoint_profile": "mainnet-basic-filter-txindex-v1",
+  "profile_id": "indexers-signet-v1",
+  "bitcoin_checkpoint_profile": "signet-basic-filter-txindex-v1",
   "filesystems": {
     "base": "btrfs",
     "overlay": "btrfs"
   },
   "electrs": {
     "version": "0.11.1",
-    "database_layout": "db/bitcoin",
+    "database_layout": "db/signet",
     "ubuntu": {
       "image": "getumbrel/electrs:v0.11.1@sha256:f1d5d4e431d39e0aaa0697014d2852880183e350ffcad612edb87183f0c11b25",
       "binary": "/usr/bin/electrs",
@@ -20,7 +20,7 @@
       "store_commit": "3e3f6760e1358e5aaa782020eb52df2d0021ce90",
       "host_data_suffix": "app-data/electrs/data/electrs",
       "container_data": "/data",
-      "database": "/data/db/bitcoin",
+      "database": "/data/db/signet",
       "service": "electrs",
       "runtime_uid": 1000,
       "runtime_gid": 1000,
@@ -50,7 +50,7 @@
       "lxc_volume_mount": "/media/startos/volumes/main",
       "subcontainer": "electrs",
       "subcontainer_datadir": "/data",
-      "database": "/data/db/bitcoin",
+      "database": "/data/db/signet",
       "source_files": {
         "startos/manifest/index.ts": "277895407e36274cdc7d1679eac6fe6e717e2018965839121baeb2267402fa49",
         "startos/main.ts": "63c1bb41a7ad93e209d19ac6fc4ea437b5d2aa5c90746ebc68d6cd1f8f3f4ae8",

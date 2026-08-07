@@ -69,13 +69,13 @@
     "stop_timeout_seconds": 360
   },
   "checkpoint": {
-    "network": "main",
+    "network": "signet",
     "blocksxor": 0,
     "prune": 0,
     "required_indexes": [
       "basic block filter index",
       "txindex"
     ],
-    "profile_id": "mainnet-basic-filter-txindex-v1"
+    "profile_id": "signet-basic-filter-txindex-v1"
   }
 }

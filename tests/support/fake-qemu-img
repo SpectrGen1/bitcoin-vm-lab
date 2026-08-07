@@ -23,12 +23,12 @@ case "$cmd" in
   check)
     [[ ! -e "$TEST_ROOT/fail-check" ]]
     [[ ! -e "$TEST_ROOT/fail-candidate-check" || "${@: -1}" != *promotion-candidate.qcow2 ]]
-    if [[ -e "$TEST_ROOT/fail-post-install" && "${@: -1}" == *bitcoin-mainnet.qcow2 ]] &&
+    if [[ -e "$TEST_ROOT/fail-post-install" && "${@: -1}" == *bitcoin-signet.qcow2 ]] &&
        { grep -q '^standalone-from=' "${@: -1}" ||
          grep -q '^kind=fresh-knots-rdts-ibd$' "$TEST_ROOT/storage/canonical/manifest.env" 2>/dev/null; }; then
       exit 1
     fi
-    if [[ -e "$TEST_ROOT/fail-rollback-install" && "${@: -1}" == *bitcoin-mainnet.qcow2 ]] &&
+    if [[ -e "$TEST_ROOT/fail-rollback-install" && "${@: -1}" == *bitcoin-signet.qcow2 ]] &&
        grep -q '^rollback-image' "${@: -1}"; then exit 1; fi
     ;;
   convert)

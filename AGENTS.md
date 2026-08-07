@@ -6,7 +6,7 @@
 - Three persistent VM environments are supported: Ubuntu, UmbrelOS, and StartOS.
 - Multiple VMs may run concurrently within configured CPU, memory, and storage limits.
 - Each VM keeps its OS and application state on its own persistent system disk.
-- Reusable mainnet state lives in one protected, standalone canonical qcow2 checkpoint.
+- Reusable signet state lives in one protected, standalone canonical qcow2 checkpoint.
 - StartOS uses one protected Btrfs qcow2 adapter backed by the ext4 canonical.
 - Every active VM receives its own disposable writable qcow2 overlay.
 - Each overlay has exactly one owning VM and may be attached to only that domain.
@@ -21,7 +21,7 @@
 - Fresh IBD, compatible import, checkpoint update, verification, and promotion use Ubuntu.
 - In consumer mode, Ubuntu exercises the canonical through a fresh disposable overlay, then stops cleanly and discards it.
 - Consumer-mode Ubuntu runs must enter the full producer verification workflow before promotion.
-- Producer evidence proves Knots, mainnet, `blocksxor=0`, RDTS, indexes, tip freshness, filesystem and overlay identity, and clean shutdown.
+- Producer evidence proves Knots, signet, `blocksxor=0`, RDTS, indexes, tip freshness, filesystem and overlay identity, and clean shutdown.
 - The shared checkpoint profile requires the basic block filter index and `txindex`
   on every platform.
 - UmbrelOS and StartOS are checkpoint consumers only.

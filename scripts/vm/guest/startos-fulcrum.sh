@@ -154,8 +154,8 @@ capture_seed() {
     [[ -f "$NATIVE/$file" ]] || fail "native Fulcrum seed lacks $file"
     install -o root -g root -m 0600 "$NATIVE/$file" "$SEED/$file"
   done
-  [[ ! -e "$NATIVE/fulc2_db.mainnet" ]] ||
-    fail "native seed unexpectedly contains a Fulcrum mainnet database"
+  [[ ! -e "$NATIVE/fulc2_db.mainnet" && ! -e "$NATIVE/fulc2_db" ]] ||
+    fail "native seed unexpectedly contains a Fulcrum database"
   jq -n --arg source "$NATIVE" --arg lxc "$LXC" --arg profile "$INDEX_SHA" \
     --arg version "$PACKAGE_VERSION" --arg captured "$(date -u +%FT%TZ)" \
     '{native_volume_source:$source,lxc_name:$lxc,profile_digest:$profile,
@@ -236,8 +236,9 @@ seed_overlay() {
     fail "StartOS Fulcrum overlay lacks reusable database at $db (base was not attached)"
   install -m 0600 "$SEED/fulcrum.conf" "$PRIVATE/fulcrum.conf"
   install -m 0600 "$SEED/store.json" "$PRIVATE/store.json"
-  sed -i -E '/^[[:space:]]*datadir[[:space:]]*=/d' "$PRIVATE/fulcrum.conf"
-  printf '\n# bitcoin-vm-lab consumer contract\ndatadir=/data\n' >>"$PRIVATE/fulcrum.conf"
+  sed -i -E '/^[[:space:]]*(datadir|network)[[:space:]]*=/d' "$PRIVATE/fulcrum.conf"
+  printf '\n# bitcoin-vm-lab consumer contract\ndatadir=/data\nnetwork=signet\n' \
+    >>"$PRIVATE/fulcrum.conf"
   jq --arg db "$db" --arg layout "$layout" \
     '.services.fulcrum + {startos_index_profile_sha256:"'"$INDEX_SHA"'",
       database_path:$db,database_layout:$layout,reused_existing_database:true}' \
@@ -299,8 +300,14 @@ verify_runtime() {
   [[ "$(jq -r .filesystem_id <<<"$runtime")" == "$(stat -f -c %i "$PRIVATE")" ]] ||
     fail "Fulcrum subcontainer does not see the overlay filesystem"
   jq -e 'any(.args[];.=="/data/fulcrum.conf") and
-    all(.args[];contains("testnet")|not)' <<<"$runtime" >/dev/null ||
-    fail "Fulcrum live arguments do not use the native mainnet configuration"
+    all(.args[];contains("testnet")|not) and
+    all(.args[];contains("mainnet")|not)' <<<"$runtime" >/dev/null ||
+    fail "Fulcrum live arguments do not use the native configuration"
+  if [[ -f "$PRIVATE/fulcrum.conf" ]]; then
+    grep -Eqi '^[[:space:]]*network[[:space:]]*=[[:space:]]*signet([[:space:]]|$)' \
+      "$PRIVATE/fulcrum.conf" ||
+      fail "StartOS Fulcrum configuration is not set to signet"
+  fi
   height="$(electrum_height 2>/dev/null || true)"
   [[ "$height" =~ ^[0-9]+$ && "$height" -gt 0 ]] ||
     fail "Fulcrum Electrum interface returned no height"
@@ -310,7 +317,7 @@ verify_runtime() {
       fail "StartOS Fulcrum height $height is below base tip $base_height (reindex suspected)"
     fi
   else
-    if ! (( height > 100000 )); then
+    if ! (( height > 1000 )); then
       fail "StartOS Fulcrum height $height is too low to prove base reuse"
     fi
   fi

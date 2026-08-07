@@ -269,7 +269,7 @@ install_service() {
   index_conf="$(write_checkpoint_indexes_conf)"
   sudo install -d -m 0755 /etc/bvml
   sudo tee "$KNOTS_CONFIG" >/dev/null <<EOF
-chain=main
+chain=signet
 datadir=$MOUNT
 blocksxor=0
 $index_conf
@@ -336,7 +336,7 @@ verify_shutdown() {
   local info indexes height headers ibd best best_header best_time median_time now tip_age
   local actual normalized digest uuid index_state expected_indexes profile_id verified_epoch
   info="$(/usr/local/bin/bitcoin-cli -conf="$KNOTS_CONFIG" getblockchaininfo)"
-  [[ "$(jq -r .chain <<<"$info")" == main ]] || fail "Knots is not on mainnet"
+  [[ "$(jq -r .chain <<<"$info")" == signet ]] || fail "Knots is not on signet"
   ibd="$(jq -r .initialblockdownload <<<"$info")"; [[ "$ibd" == false ]] || fail "IBD is incomplete"
   height="$(jq -r .blocks <<<"$info")"; headers="$(jq -r .headers <<<"$info")"
   [[ "$height" == "$headers" ]] || fail "headers remain ahead of blocks"
@@ -368,11 +368,11 @@ verify_shutdown() {
   sudo install -d -m 0750 "$MOUNT/.bvml"
   sudo tee "$EVIDENCE" >/dev/null <<EOF
 vm=ubuntu
-network=main
+network=signet
 blocksxor=0
 synced=1
 clean_shutdown=1
-datadir_layout=root-datadir
+datadir_layout=signet-subdir
 rdts_validated=1
 rdts_profile_name=$RDTS_PROFILE_NAME
 rdts_profile_sha256=${KNOTS_RDTS_PROFILE_SHA256,,}

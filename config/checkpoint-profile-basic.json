@@ -1,5 +1,5 @@
 {
-  "id": "mainnet-basic-filter-txindex-v1",
+  "id": "signet-basic-filter-txindex-v1",
   "indexes": [
     "basic block filter index",
     "txindex"

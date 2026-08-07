@@ -16,16 +16,16 @@ if [[ "${BVML_TESTING:-0}" != 1 && -f "$BVML_HOST_CONFIG_DIR/host.env" ]]; then
 fi
 
 CANONICAL_DIR="$BVML_STORAGE/canonical"
-CANONICAL="$CANONICAL_DIR/bitcoin-mainnet.qcow2"
+CANONICAL="$CANONICAL_DIR/bitcoin-signet.qcow2"
 CANONICAL_META="$CANONICAL_DIR/manifest.env"
-ROLLBACK="$CANONICAL_DIR/bitcoin-mainnet.rollback.qcow2"
+ROLLBACK="$CANONICAL_DIR/bitcoin-signet.rollback.qcow2"
 ROLLBACK_META="$CANONICAL_DIR/rollback-manifest.env"
 if [[ -n "$ROLLBACK_DESTINATION" ]]; then
-  ROLLBACK="$ROLLBACK_DESTINATION/bitcoin-mainnet.rollback.qcow2"
+  ROLLBACK="$ROLLBACK_DESTINATION/bitcoin-signet.rollback.qcow2"
   ROLLBACK_META="$ROLLBACK_DESTINATION/rollback-manifest.env"
 fi
 ACTIVE_DIR="$BVML_STORAGE/active"
-BOOTSTRAP="$ACTIVE_DIR/bitcoin-mainnet-bootstrap.qcow2"
+BOOTSTRAP="$ACTIVE_DIR/bitcoin-signet-bootstrap.qcow2"
 BOOTSTRAP_META="$ACTIVE_DIR/bootstrap-manifest.env"
 BOOTSTRAP_VERIFY="$ACTIVE_DIR/bootstrap-verification.env"
 IMPORT_CANDIDATE="$CANONICAL_DIR/import-candidate.qcow2"
@@ -39,7 +39,7 @@ LOCK_FILE="$GLOBAL_LOCK_FILE"
 RECOVERY_META="$RUN_DIR/recovery.env"
 ADAPTER_STATE_DIR="$RUN_DIR/adapters"
 STARTOS_LAYER_DIR="$BVML_STORAGE/adapters/startos"
-STARTOS_LAYER="$STARTOS_LAYER_DIR/bitcoin-mainnet-btrfs.qcow2"
+STARTOS_LAYER="$STARTOS_LAYER_DIR/bitcoin-signet-btrfs.qcow2"
 STARTOS_LAYER_META="$STARTOS_LAYER_DIR/manifest.env"
 STARTOS_LAYER_CANDIDATE="$STARTOS_LAYER_DIR/conversion-candidate.qcow2"
 STARTOS_LAYER_CANDIDATE_META="$STARTOS_LAYER_DIR/conversion-candidate.env"
@@ -47,7 +47,7 @@ STARTOS_LAYER_RECOVERY="$STARTOS_LAYER_DIR/recovery.env"
 STARTOS_LAYER_LOCK="$STARTOS_LAYER_DIR/adapter.lock"
 INDEX_ROOT="$BVML_STORAGE/indexes"
 INDEX_RUN_ROOT="$RUN_DIR/indexes"
-LEGACY_OVERLAY="$ACTIVE_DIR/bitcoin-mainnet-overlay.qcow2"
+LEGACY_OVERLAY="$ACTIVE_DIR/bitcoin-signet-overlay.qcow2"
 LEGACY_OVERLAY_META="$ACTIVE_DIR/manifest.env"
 LEGACY_VERIFY_META="$ACTIVE_DIR/ubuntu-verification.env"
 LEGACY_OWNER_FILE="$RUN_DIR/owner.env"
@@ -55,7 +55,7 @@ LEGACY_ADAPTER_RECOVERY_META="$RUN_DIR/umbrel-recovery.env"
 
 lifecycle_dir() { printf '%s/%s' "$LIFECYCLE_ROOT" "$1"; }
 lifecycle_active_dir() { printf '%s/%s' "$ACTIVE_DIR" "$1"; }
-lifecycle_overlay() { printf '%s/bitcoin-mainnet-overlay.qcow2' "$(lifecycle_active_dir "$1")"; }
+lifecycle_overlay() { printf '%s/bitcoin-signet-overlay.qcow2' "$(lifecycle_active_dir "$1")"; }
 lifecycle_meta() { printf '%s/manifest.env' "$(lifecycle_dir "$1")"; }
 lifecycle_owner() { printf '%s/owner.env' "$(lifecycle_dir "$1")"; }
 lifecycle_verify() { printf '%s/verification.env' "$(lifecycle_dir "$1")"; }
@@ -884,9 +884,11 @@ validate_checkpoint_image() {
   local image="$1" xor_bytes
   qemu-img check "$image" >/dev/null || return 1
   qemu-img info --output=json "$image" | grep -q '"backing-filename"' && return 1
-  virt-ls -a "$image" -m /dev/sda / | grep -qx blocks || return 1
-  virt-ls -a "$image" -m /dev/sda / | grep -qx chainstate || return 1
-  xor_bytes="$(virt-cat -a "$image" -m /dev/sda /blocks/xor.dat 2>/dev/null |
+  # Signet stores chain data under $datadir/signet/ (Bitcoin Core network subdir).
+  virt-ls -a "$image" -m /dev/sda / | grep -qx signet || return 1
+  virt-ls -a "$image" -m /dev/sda /signet | grep -qx blocks || return 1
+  virt-ls -a "$image" -m /dev/sda /signet | grep -qx chainstate || return 1
+  xor_bytes="$(virt-cat -a "$image" -m /dev/sda /signet/blocks/xor.dat 2>/dev/null |
     od -An -v -tu1 | tr -s ' ' '\n' | sed '/^$/d' || true)"
   [[ -z "$xor_bytes" ]] || ! grep -qv '^0$' <<<"$xor_bytes"
 }
@@ -976,9 +978,9 @@ canonical_preflight() {
   [[ -z "$backing" ]] || die "canonical checkpoint is not standalone"
   qemu-img check "$CANONICAL" >/dev/null || die "canonical qemu-img check failed"
   validate_checkpoint_image "$CANONICAL" || die "canonical datadir layout or non-XOR validation failed"
-  [[ "$(meta_get "$CANONICAL_META" network)" == main ]] || die "canonical network is not mainnet"
+  [[ "$(meta_get "$CANONICAL_META" network)" == signet ]] || die "canonical network is not signet"
   [[ "$(meta_get "$CANONICAL_META" blocksxor)" == 0 ]] || die "canonical manifest is not non-XOR"
-  [[ "$(meta_get "$CANONICAL_META" layout)" == root-datadir ]] || die "unsupported canonical datadir layout"
+  [[ "$(meta_get "$CANONICAL_META" layout)" == signet-subdir ]] || die "unsupported canonical datadir layout"
   validate_checkpoint_profile
   profile_id="$(checkpoint_profile_id)"
   [[ "$(meta_get "$CANONICAL_META" checkpoint_profile_id)" == "$profile_id" ]] ||

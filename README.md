@@ -1,7 +1,7 @@
 # bitcoin-vm-lab
 
 `bitcoin-vm-lab` manages persistent Ubuntu, UmbrelOS, and StartOS guests under
-Gentoo system libvirt. One protected Bitcoin mainnet checkpoint may back one
+Gentoo system libvirt. One protected Bitcoin signet checkpoint may back one
 independent disposable qcow2 overlay per VM, allowing resource-limited
 concurrent consumer testing. The canonical image is never attached directly.
 
@@ -9,17 +9,17 @@ Runtime storage defaults to `/var/lib/libvirt/images/bitcoin-vm-lab`, outside
 the repository:
 
 ```text
-canonical/bitcoin-mainnet.qcow2          protected checkpoint
-canonical/bitcoin-mainnet.rollback.qcow2 optional full-size rollback (disabled by default)
-adapters/startos/bitcoin-mainnet-btrfs.qcow2 protected Btrfs filesystem adapter
-active/bitcoin-mainnet-bootstrap.qcow2   incomplete first-IBD image, when used
+canonical/bitcoin-signet.qcow2          protected checkpoint
+canonical/bitcoin-signet.rollback.qcow2 optional full-size rollback (disabled by default)
+adapters/startos/bitcoin-signet-btrfs.qcow2 protected Btrfs filesystem adapter
+active/bitcoin-signet-bootstrap.qcow2   incomplete first-IBD image, when used
 active/{ubuntu,umbrel,startos}/          per-VM disposable overlays
 run/lifecycles/{ubuntu,umbrel,startos}/  owner, manifest, evidence, lock, recovery
 indexes/{electrs,fulcrum}/base.qcow2     protected reusable Electrum index state
 vms/{ubuntu,umbrel,startos}/             persistent OS/application disks
 ```
 
-Fresh Bitcoin Knots mainnet IBD is the normal initialization path:
+Fresh Bitcoin Knots signet IBD is the normal initialization path:
 
 ```bash
 cp config/local.env.example config/local.env
@@ -61,7 +61,7 @@ bootstrap, canonical, overlay, verification, or recovery state exists.
 
 The bootstrap disk remains explicitly marked incomplete until authenticated
 Knots, the operator-approved digest-pinned release-specific RDTS profile,
-mainnet sync, required indexes, best-block freshness, filesystem identity, and
+signet sync, required indexes, best-block freshness, filesystem identity, and
 clean shutdown evidence all validate.
 `blocksxor=0` is written before the first Knots start. The Ubuntu systemd unit
 requires the expected mounted filesystem and fails closed if the disk or UUID
@@ -112,7 +112,7 @@ filesystem/partition/RAID/LVM signatures before formatting.
 An existing datadir is optional and has no default:
 
 ```bash
-./bin/bvml checkpoint-import /consistent/snapshot/bitcoin --consistent-snapshot --assert-mainnet
+./bin/bvml checkpoint-import /consistent/snapshot/bitcoin --consistent-snapshot --assert-signet
 ```
 
 Import rejects XOR block storage and requires an explicit stopped-node or

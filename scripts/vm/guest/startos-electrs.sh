@@ -234,7 +234,15 @@ seed_overlay() {
   if [[ -f "$SEED/store.json" ]]; then
     install -m 0600 "$SEED/store.json" "$PRIVATE/store.json"
   fi
-  # Keep cookie path for bitcoind dependency; DB lives under /data/db/bitcoin.
+  # Force signet network if the package TOML exposes a network key.
+  if grep -Eq '^[[:space:]]*network[[:space:]]*=' "$PRIVATE/electrs.toml" 2>/dev/null; then
+    sed -i -E 's/^[[:space:]]*network[[:space:]]*=.*/network = "signet"/' \
+      "$PRIVATE/electrs.toml"
+  else
+    printf '\n# bitcoin-vm-lab consumer contract\nnetwork = "signet"\n' \
+      >>"$PRIVATE/electrs.toml"
+  fi
+  # Cookie for signet lives under the network subdir of the bitcoind datadir.
   jq --arg db "$db" --arg layout "$layout" \
     '.services.electrs + {startos_index_profile_sha256:"'"$INDEX_SHA"'",
       database_path:$db,database_layout:$layout,reused_existing_database:true}' \
@@ -302,7 +310,7 @@ verify_runtime() {
       fail "StartOS Electrs height $height is below base tip $base_height (reindex suspected)"
     fi
   else
-    if ! (( height > 100000 )); then
+    if ! (( height > 1000 )); then
       fail "StartOS Electrs height $height is too low to prove base reuse"
     fi
   fi

@@ -615,7 +615,7 @@ bootstrap_promote() {
   printf '%s  %s\n' "$id" "$(basename "$CANONICAL")" >"$bundle/canonical-image.sha256"
   meta_tmp="$CANONICAL_META.new"
   write_env_file "$meta_tmp" "id=$id" "generation=$generation" \
-    "created=$(date -u +%FT%TZ)" "network=main" "blocksxor=0" "layout=root-datadir" \
+    "created=$(date -u +%FT%TZ)" "network=signet" "blocksxor=0" "layout=signet-subdir" \
     "kind=fresh-knots-rdts-ibd" "rollback_retention=none" "disaster_recovery=re-IBD" \
     "source_bootstrap_id=$(meta_get "$BOOTSTRAP_META" bootstrap_id)" \
     "filesystem_uuid=$(meta_get "$BOOTSTRAP_VERIFY" filesystem_uuid)" \
@@ -679,29 +679,29 @@ reset_vm() {
 }
 
 source_xor_check() {
-  local source="$1" xor="$source/blocks/xor.dat" byte
-  [[ -d "$source/blocks" && -d "$source/chainstate" ]] ||
-    die "source must contain mainnet blocks/ and chainstate/"
+  local source="$1" xor="$source/signet/blocks/xor.dat" byte
+  [[ -d "$source/signet/blocks" && -d "$source/signet/chainstate" ]] ||
+    die "source must contain signet/blocks and signet/chainstate (full Knots datadir)"
   [[ -e "$xor" ]] || return 0
   while read -r byte; do
-    [[ "$byte" == 0 ]] || die "source blocks/xor.dat contains a non-zero XOR key. blocksxor=0 does not convert block files. Start Knots with the source's current format and perform a deliberate non-XOR rebuild/reindex into a new datadir before importing."
+    [[ "$byte" == 0 ]] || die "source signet/blocks/xor.dat contains a non-zero XOR key. blocksxor=0 does not convert block files. Start Knots with the source's current format and perform a deliberate non-XOR rebuild/reindex into a new datadir before importing."
   done < <(od -An -v -tu1 "$xor" | tr -s ' ' '\n' | sed '/^$/d')
 }
 
 checkpoint_import() {
-  local source="" source_mode="" mainnet_asserted=0
+  local source="" source_mode="" signet_asserted=0
   while (($#)); do case "$1" in
     --assert-source-stopped) source_mode=stopped; shift ;;
     --consistent-snapshot) source_mode=snapshot; shift ;;
-    --assert-mainnet) mainnet_asserted=1; shift ;;
-    --*) die "checkpoint-import SOURCE (--assert-source-stopped|--consistent-snapshot) --assert-mainnet" ;;
+    --assert-signet) signet_asserted=1; shift ;;
+    --*) die "checkpoint-import SOURCE (--assert-source-stopped|--consistent-snapshot) --assert-signet" ;;
     *) [[ -z "$source" ]] || die "only one import source may be supplied"; source="$1"; shift ;;
   esac; done
   [[ -n "$source" ]] || die "checkpoint-import requires an explicit source path"
   [[ "$source" == /* && "$source" != *$'\n'* && "$source" != *$'\r'* ]] ||
     die "checkpoint-import source must be an absolute path without control characters"
   [[ -n "$source_mode" ]] || die "assert a clean stop or consistent snapshot explicitly"
-  (( mainnet_asserted == 1 )) || die "explicit --assert-mainnet is required after source validation"
+  (( signet_asserted == 1 )) || die "explicit --assert-signet is required after source validation"
   need qemu-img; need virt-make-fs; need virt-ls; need virt-customize; need tar
   assert_initialization_state_empty "checkpoint import"
   [[ -d "$source" ]] || die "source datadir does not exist: $source"
@@ -715,33 +715,34 @@ checkpoint_import() {
   source_xor_check "$source"
   local candidate="$IMPORT_CANDIDATE" bytes size_bytes id generation
   rm -f -- "$candidate"
-  local import_paths=(blocks chainstate)
-  [[ ! -d "$source/indexes" ]] || import_paths+=(indexes)
-  bytes="$(du -sb "${import_paths[@]/#/$source/}" | awk '{s+=$1} END {print s+0}')"
+  # Import the full signet network subdirectory (blocks, chainstate, indexes).
+  local import_paths=(signet)
+  bytes="$(du -sb "$source/signet" | awk '{print $1+0}')"
   (( bytes > 0 )) || die "source allocation could not be measured"
   size_bytes=$(( bytes + (bytes * CHECKPOINT_HEADROOM_PERCENT / 100) ))
   (( size_bytes > bytes )) || size_bytes=$((bytes + 1073741824))
   note "creating an absolute ${size_bytes}-byte import image from ${bytes} source bytes"
-  tar -C "$source" -cf - --exclude='blocks/.lock' --exclude='*.log' \
+  tar -C "$source" -cf - --exclude='signet/blocks/.lock' --exclude='*.log' \
     "${import_paths[@]}" |
     virt-make-fs --format=qcow2 --type=ext4 --size="$size_bytes" - "$candidate"
   virt-customize -a "$candidate" \
-    --run-command "chown -R $BITCOIN_DATADIR_UID:$BITCOIN_DATADIR_GID /blocks /chainstate; chmod 0750 /blocks /chainstate; if test -d /indexes; then chown -R $BITCOIN_DATADIR_UID:$BITCOIN_DATADIR_GID /indexes; chmod 0750 /indexes; fi" \
+    --run-command "chown -R $BITCOIN_DATADIR_UID:$BITCOIN_DATADIR_GID /signet; chmod 0750 /signet /signet/blocks /signet/chainstate; if test -d /signet/indexes; then chmod 0750 /signet/indexes; fi" \
     >/dev/null
   qemu-img check "$candidate"
-  virt-ls -a "$candidate" -m /dev/sda / | grep -qx blocks || die "candidate lacks blocks/"
-  virt-ls -a "$candidate" -m /dev/sda / | grep -qx chainstate || die "candidate lacks chainstate/"
+  virt-ls -a "$candidate" -m /dev/sda / | grep -qx signet || die "candidate lacks signet/"
+  virt-ls -a "$candidate" -m /dev/sda /signet | grep -qx blocks || die "candidate lacks signet/blocks/"
+  virt-ls -a "$candidate" -m /dev/sda /signet | grep -qx chainstate || die "candidate lacks signet/chainstate/"
   validate_checkpoint_profile
   if [[ "$(checkpoint_profile_indexes_json)" != '[]' ]]; then
-    virt-ls -a "$candidate" -m /dev/sda / | grep -qx indexes || die "candidate lacks verified indexes/"
+    virt-ls -a "$candidate" -m /dev/sda /signet | grep -qx indexes || die "candidate lacks verified signet/indexes/"
   fi
   id="$(sha256sum "$candidate" | awk '{print $1}')"
   generation="$(new_id)"
   write_env_file "$IMPORT_META" \
     "id=$id" "generation=$generation" "created=$(date -u +%FT%TZ)" \
-    "source=$source" "source_consistency=$source_mode" "source_network_assertion=mainnet" \
+    "source=$source" "source_consistency=$source_mode" "source_network_assertion=signet" \
     "source_bytes=$bytes" "image_bytes=$size_bytes" \
-    "network=main" "blocksxor=0" "layout=root-datadir" "kind=initial-import" \
+    "network=signet" "blocksxor=0" "layout=signet-subdir" "kind=initial-import" \
     "checkpoint_profile_id=$(checkpoint_profile_id)" \
     "checkpoint_profile_sha256=${CHECKPOINT_PROFILE_SHA256,,}"
   mv -- "$candidate" "$CANONICAL"
@@ -764,8 +765,8 @@ verify_promotion_evidence() {
     checkpoint_profile_id checkpoint_profile_sha256 index_state_json shutdown_id; do
     [[ -n "$(meta_get "$evidence" "$key")" ]] || die "verification metadata missing $key"
   done
-  for expected in "vm=ubuntu" "network=main" "blocksxor=0" "synced=1" \
-                  "clean_shutdown=1" "datadir_layout=root-datadir" "rdts_validated=1"; do
+  for expected in "vm=ubuntu" "network=signet" "blocksxor=0" "synced=1" \
+                  "clean_shutdown=1" "datadir_layout=signet-subdir" "rdts_validated=1"; do
     [[ "$(meta_get "$evidence" "${expected%%=*}")" == "${expected#*=}" ]] ||
       die "verification requirement failed: $expected"
   done
@@ -870,8 +871,8 @@ checkpoint_profile_migrate_guest() {
   [[ "$(owner_vm)" == ubuntu && "$(domain_state ubuntu)" == running ]] ||
     die "Ubuntu must actively own and run its update overlay"
   validate_checkpoint_profile
-  [[ "$(checkpoint_profile_id)" == mainnet-basic-filter-txindex-v1 ||
-     "$(checkpoint_profile_id)" == mainnet-basic-filter-v1 ]] ||
+  [[ "$(checkpoint_profile_id)" == signet-basic-filter-txindex-v1 ||
+     "$(checkpoint_profile_id)" == signet-basic-filter-v1 ]] ||
     die "active host profile is not a supported basic-filter migration target"
   local profile64
   profile64="$(base64 -w0 "$CHECKPOINT_PROFILE_FILE")"
@@ -932,7 +933,7 @@ checkpoint_promote() {
   id="$(sha256sum "$candidate" | awk '{print $1}')"
   write_env_file "$candidate_meta" "id=$id" "created=$(date -u +%FT%TZ)" \
     "generation=$(new_id)" \
-    "network=main" "blocksxor=0" "layout=root-datadir" "kind=knots-rdts-promotion" \
+    "network=signet" "blocksxor=0" "layout=signet-subdir" "kind=knots-rdts-promotion" \
     "knots_version_normalized=$(meta_get "$VERIFY_META" knots_version_normalized)" \
     "checkpoint_profile_id=$(checkpoint_profile_id)" \
     "checkpoint_profile_sha256=${CHECKPOINT_PROFILE_SHA256,,}"
@@ -1004,8 +1005,8 @@ checkpoint_commit_no_rollback() {
   assert_no_process_reference "$CANONICAL"
   assert_overlay_chain
   verify_promotion_evidence "$VERIFY_META" overlay
-  [[ "$(meta_get "$VERIFY_META" checkpoint_profile_id)" == mainnet-basic-filter-txindex-v1 ||
-     "$(meta_get "$VERIFY_META" checkpoint_profile_id)" == mainnet-basic-filter-v1 ]] ||
+  [[ "$(meta_get "$VERIFY_META" checkpoint_profile_id)" == signet-basic-filter-txindex-v1 ||
+     "$(meta_get "$VERIFY_META" checkpoint_profile_id)" == signet-basic-filter-v1 ]] ||
     die "no-rollback commit requires a basic-filter checkpoint profile"
   qemu-img check -r leaks "$OVERLAY"
   qemu-img check "$CANONICAL"
@@ -1054,7 +1055,7 @@ checkpoint_commit_no_rollback() {
   new_id="$(sha256sum "$CANONICAL" | awk '{print $1}')"
   write_env_file "$CANONICAL_META" \
     "id=$new_id" "generation=$new_generation" "created=$(date -u +%FT%TZ)" \
-    "network=main" "blocksxor=0" "layout=root-datadir" \
+    "network=signet" "blocksxor=0" "layout=signet-subdir" \
     "kind=knots-rdts-in-place-commit" \
     "knots_version_normalized=$(meta_get "$VERIFY_META" knots_version_normalized)" \
     "checkpoint_profile_id=$(checkpoint_profile_id)" \

@@ -52,7 +52,7 @@
    or duplicated profiled values rejected. The service
    has `RequiresMountsFor`, `ConditionPathIsMountPoint`, and a UUID check. It
    cannot fall back to `/srv/bitcoin` on the OS disk.
-8. Complete mainnet IBD. Run guest `verify-shutdown`. It captures actual Knots
+8. Complete signet IBD. Run guest `verify-shutdown`. It captures actual Knots
    normalized version/digest, chain, heights, best hash, best-block and median
    times, calculated tip age, IBD state, structured required-index state,
    observed RDTS arguments/profile digest, filesystem UUID, and a new shutdown
@@ -94,9 +94,9 @@ guest command's real exit status. It is intentionally unavailable once
 There is no source default and normal validation has no source dependency:
 
 ```bash
-./bin/bvml checkpoint-import /snapshot/bitcoin --consistent-snapshot --assert-mainnet
+./bin/bvml checkpoint-import /snapshot/bitcoin --consistent-snapshot --assert-signet
 # or, only after proving a clean stop and absence of a stale .lock:
-./bin/bvml checkpoint-import /data/bitcoin --assert-source-stopped --assert-mainnet
+./bin/bvml checkpoint-import /data/bitcoin --assert-source-stopped --assert-signet
 ```
 
 Import requires `blocks/` and `chainstate/`; `indexes/` is optional unless the
@@ -244,7 +244,7 @@ from flattened candidates.
 Promotion requires all domains exactly shut off, no attachment, no owner,
 no non-Ubuntu dependent overlay, a valid Ubuntu backing chain, current evidence, matching
 normalized Knots/RDTS profile digest and observed arguments,
-mainnet/non-XOR/filesystem/index-profile state, a fresh best-block timestamp,
+signet/non-XOR/filesystem/index-profile state, a fresh best-block timestamp,
 and clean shutdown. It reports
 candidate and rollback space, flattens and validates a standalone candidate,
 then rotates on the canonical filesystem. Any post-install failure
@@ -298,7 +298,7 @@ unchanged `${APP_DATA_DIR}/data:/data` bind exposes the mounted child at
 All app operations use `umbreld client`. Docker is read-only evidence:
 validation proves the official image and Compose service, UID, entrypoint,
 command, restart/grace behavior, sidecars, actual non-PID-1 Knots executable
-and digest, datadir, mainnet, generated `consensusrules=rdts`, non-XOR config,
+and digest, datadir, signet, generated `consensusrules=rdts`, non-XOR config,
 chain/index state, and fresh tip. Stop uses the official grace path, checks no
 process or open file remains, syncs, cleanly unmounts, restores the fail-closed
 mountpoint, then permits guest shutdown and host detachment. A busy mount or
@@ -388,7 +388,7 @@ physical corruption or a partially failed in-place commit; that policy’s
 disaster recovery is a fresh IBD.
 
 Validation proves the three filesystem views, actual non-PID-1 process,
-official executable digest/version, mainnet synchronization, non-pruned
+official executable digest/version, signet synchronization, non-pruned
 configuration, required indexes, `blocksxor=0`, and the `reduced_data`
 deployment from `getdeploymentinfo`. Stop uses the native package stop, rejects
 open files or busy mounts, restores the hidden native volume, then permits VM

@@ -31,14 +31,14 @@ cleanup() { mountpoint -q "$mountpoint" && umount "$mountpoint" || true; }
 trap cleanup EXIT
 
 validate_tree() {
-  [[ -d "$mountpoint/blocks" && -d "$mountpoint/chainstate" ]] ||
-    fail "converted datadir lacks blocks or chainstate"
+  [[ -d "$mountpoint/signet/blocks" && -d "$mountpoint/signet/chainstate" ]] ||
+    fail "converted datadir lacks signet/blocks or signet/chainstate"
   local index relative_path
   while IFS= read -r index; do
     case "$index" in
-      "basic block filter index") relative_path=indexes/blockfilter/basic ;;
-      txindex) relative_path=indexes/txindex ;;
-      coinstatsindex) relative_path=indexes/coinstats ;;
+      "basic block filter index") relative_path=signet/indexes/blockfilter/basic ;;
+      txindex) relative_path=signet/indexes/txindex ;;
+      coinstatsindex) relative_path=signet/indexes/coinstats ;;
       *) fail "unsupported checkpoint index layout: $index" ;;
     esac
     [[ -d "$mountpoint/$relative_path" ]] ||

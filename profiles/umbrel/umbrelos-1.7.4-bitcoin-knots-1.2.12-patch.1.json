@@ -75,7 +75,7 @@
     "settings_schema_sha256": "ebd28442e21f7c8f9064c129a32cc282380636c8855472b33aff428344080114",
     "settings_metadata_sha256": "977d51ef40b5b1936f7905b1f4329c4ddfd20f68a2bb20152ab67e352003ca1f",
     "required_settings": {
-      "chain": "main",
+      "chain": "signet",
       "version": "v29.3.knots20260508",
       "consensusrules": true,
       "prune": 0,
@@ -89,8 +89,8 @@
     "base_config": [
       "blocksxor=0"
     ],
-    "checkpoint_profile_id": "mainnet-basic-filter-txindex-v1",
-    "checkpoint_profile_sha256": "dd756087a607d297655db81e7b3f92583143e26cbd9b30394c69cd3836a8f0ff",
+    "checkpoint_profile_id": "signet-basic-filter-txindex-v1",
+    "checkpoint_profile_sha256": "49b1e170a2fdc4a5c5ad5c4b439fd1c88b9916d15d15027f199b2666b86915e9",
     "required_indexes": [
       "basic block filter index"
     ],
