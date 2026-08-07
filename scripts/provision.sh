@@ -675,25 +675,37 @@ guest_repair_scripts() {
     is_defined startos || die "StartOS VM is not defined"
     [[ "$(domain_state startos)" == running ]] || die "StartOS must be exactly running"
     validate_startos_profile
-    bash -n "$ROOT/scripts/vm/guest/startos-adapter.sh" ||
-      die "StartOS guest adapter fails shell syntax validation"
-    local guest_root adapter64
+    bash -n "$ROOT/scripts/vm/guest/startos-adapter.sh" \
+      "$ROOT/scripts/vm/guest/startos-electrs.sh" \
+      "$ROOT/scripts/vm/guest/startos-fulcrum.sh" ||
+      die "StartOS guest adapter assets fail shell syntax validation"
+    local guest_root adapter64 electrs64 fulcrum64
     guest_root="$(jq -er '.os.management_root|select(startswith("/"))' "$STARTOS_PROFILE")"
     startos_exec_sync /bin/bash 60 -c "
       test \"\$(sha256sum '$guest_root/startos-profile.json' | awk '{print \$1}')\" = '${STARTOS_PROFILE_SHA256,,}'
       test \"\$(tr -d '[:space:]' <'$guest_root/startos-profile.sha256')\" = '${STARTOS_PROFILE_SHA256,,}'
     " || die "StartOS script repair refused because its installed profile digest changed"
     adapter64="$(base64 -w0 "$ROOT/scripts/vm/guest/startos-adapter.sh")"
+    electrs64="$(base64 -w0 "$ROOT/scripts/vm/guest/startos-electrs.sh")"
+    fulcrum64="$(base64 -w0 "$ROOT/scripts/vm/guest/startos-fulcrum.sh")"
     startos_exec_sync /bin/bash 60 -c "
       set -Eeuo pipefail
       a=\$(mktemp '$guest_root/bin/startos-adapter.sh.XXXXXX')
-      trap 'rm -f -- \"\$a\"' EXIT
+      e=\$(mktemp '$guest_root/bin/startos-electrs.sh.XXXXXX')
+      f=\$(mktemp '$guest_root/bin/startos-fulcrum.sh.XXXXXX')
+      trap 'rm -f -- \"\$a\" \"\$e\" \"\$f\"' EXIT
       printf %s '$adapter64' | base64 -d >\"\$a\"
-      chown root:root \"\$a\"; chmod 0755 \"\$a\"; bash -n \"\$a\"
+      printf %s '$electrs64' | base64 -d >\"\$e\"
+      printf %s '$fulcrum64' | base64 -d >\"\$f\"
+      chown root:root \"\$a\" \"\$e\" \"\$f\"
+      chmod 0755 \"\$a\" \"\$e\" \"\$f\"
+      bash -n \"\$a\" \"\$e\" \"\$f\"
       mv -f -- \"\$a\" '$guest_root/bin/startos-adapter.sh'
+      mv -f -- \"\$e\" '$guest_root/bin/startos-electrs.sh'
+      mv -f -- \"\$f\" '$guest_root/bin/startos-fulcrum.sh'
       trap - EXIT
     "
-    note "updated the persistent StartOS adapter after proving its profile digest is unchanged"
+    note "updated persistent StartOS adapter and index scripts after proving profile digests"
     return
   fi
   if [[ "$1" == umbrel ]]; then

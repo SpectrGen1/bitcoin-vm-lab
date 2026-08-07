@@ -224,13 +224,58 @@ mount_overlay() {
     fail "Electrs overlay did not propagate into its package LXC"
 }
 
-# Official StartOS Electrs (community package 0.11.1:17) hard-codes
-# network=bitcoin in package store and rewrites electrs.toml on every start.
-# Signet/testnet are not supported by the package (see electrs-startos README:
-# "Mainnet only — network is fixed to bitcoin"). Lab signet consumers therefore
-# cannot prove Electrs overlay reuse through start-cli on this package version.
-assert_startos_electrs_signet_supported() {
-  fail "official StartOS Electrs package ${PACKAGE_VERSION} is mainnet-only (network fixed to bitcoin); signet index overlay reuse is unsupported until the package exposes signet"
+# Official Electrs package hard-codes network=bitcoin in its FileHelper schema and
+# rewrites electrs.toml on every start (mainnet-only). Patch the package image
+# PATH so a volume-resident wrapper rewrites the TOML to signet immediately
+# before exec'ing the real /usr/bin/electrs binary. Cookie path is forced to
+# /mnt/bitcoind/signet/.cookie (bitcoind adapter also aliases /.cookie).
+install_signet_electrs_wrapper() {
+  install -d -m 0755 "$PRIVATE/bin"
+  cat >"$PRIVATE/bin/electrs" <<'WRAP'
+#!/bin/bash
+# bitcoin-vm-lab: force signet for the official StartOS Electrs package
+set -euo pipefail
+conf=/data/electrs.toml
+if [[ -f "$conf" ]]; then
+  if grep -Eq '^[[:space:]]*network[[:space:]]*=' "$conf"; then
+    sed -i -E 's/^[[:space:]]*network[[:space:]]*=.*/network = "signet"/' "$conf"
+  else
+    printf '\nnetwork = "signet"\n' >>"$conf"
+  fi
+  if [[ -f /mnt/bitcoind/signet/.cookie ]]; then
+    if grep -Eq '^[[:space:]]*cookie_file[[:space:]]*=' "$conf"; then
+      sed -i -E 's|^[[:space:]]*cookie_file[[:space:]]*=.*|cookie_file = "/mnt/bitcoind/signet/.cookie"|' \
+        "$conf"
+    else
+      printf 'cookie_file = "/mnt/bitcoind/signet/.cookie"\n' >>"$conf"
+    fi
+  fi
+fi
+exec /usr/bin/electrs "$@"
+WRAP
+  chmod 0755 "$PRIVATE/bin/electrs"
+}
+
+# Package subcontainer env is stored next to the image as <imageId>.env under
+# the package LXC rootfs. Prepend /data/bin so our wrapper wins PATH lookup.
+patch_electrs_package_path_env() {
+  local envfile="/var/lib/lxc/$LXC/rootfs/media/startos/images/electrs.env" path_line
+  [[ -n "${LXC:-}" && -d "/var/lib/lxc/$LXC/rootfs" ]] ||
+    fail "Electrs package LXC is unavailable for PATH patch"
+  path_line='PATH=/data/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  if [[ -f "$envfile" ]]; then
+    # Preserve non-PATH keys if any ever appear; force PATH first.
+    if grep -Eq '^PATH=' "$envfile"; then
+      sed -i -E "s|^PATH=.*|$path_line|" "$envfile"
+    else
+      printf '%s\n' "$path_line" | cat - "$envfile" >"$envfile.new"
+      mv -f -- "$envfile.new" "$envfile"
+    fi
+  else
+    printf '%s\n' "$path_line" >"$envfile"
+  fi
+  grep -Eq '^PATH=/data/bin:' "$envfile" ||
+    fail "failed to patch Electrs package PATH for signet wrapper"
 }
 
 seed_overlay() {
@@ -243,12 +288,20 @@ seed_overlay() {
   if [[ -f "$SEED/store.json" ]]; then
     install -m 0600 "$SEED/store.json" "$PRIVATE/store.json"
   fi
-  # Cookie for signet lives under the network subdir of the bitcoind datadir.
+  # Prefer signet values in the seed TOML; package start rewrites network=bitcoin
+  # which the PATH wrapper corrects before the real electrs binary runs.
+  if grep -Eq '^[[:space:]]*network[[:space:]]*=' "$PRIVATE/electrs.toml"; then
+    sed -i -E 's/^[[:space:]]*network[[:space:]]*=.*/network = "signet"/' \
+      "$PRIVATE/electrs.toml"
+  else
+    printf '\n# bitcoin-vm-lab consumer contract\nnetwork = "signet"\n' \
+      >>"$PRIVATE/electrs.toml"
+  fi
+  install_signet_electrs_wrapper
   jq --arg db "$db" --arg layout "$layout" \
     '.services.electrs + {startos_index_profile_sha256:"'"$INDEX_SHA"'",
       database_path:$db,database_layout:$layout,reused_existing_database:true}' \
     "$ACTIVE" >"$PRIVATE/.bvml-index-overlay.json"
-  assert_startos_electrs_signet_supported
 }
 
 runtime_json() {
@@ -332,9 +385,31 @@ verify_runtime() {
 }
 
 setup() {
-  load_profiles
-  # Fail closed before mount/start: official package cannot open db/signet.
-  assert_startos_electrs_signet_supported
+  load_profiles; package_stopped || { start-cli package stop "$PACKAGE"; wait_status stopped; }
+  mount_overlay; seed_overlay
+  patch_electrs_package_path_env
+  start-cli package start "$PACKAGE" --force; wait_status running
+  # Package start regenerates electrs.env from the image; re-apply PATH patch
+  # and bounce once so the wrapper is on PATH for the live subcontainer.
+  patch_electrs_package_path_env
+  install_signet_electrs_wrapper
+  start-cli package restart "$PACKAGE" --force 2>/dev/null ||
+    start-cli package restart "$PACKAGE"
+  wait_status running
+  patch_electrs_package_path_env
+  install_signet_electrs_wrapper
+  local waited=0
+  while ! ( verify_runtime >/dev/null 2>"$STATE/electrs-verify.err" ); do
+    if ! (( waited < TIMEOUT )); then
+      cat "$STATE/electrs-verify.err" >&2
+      fail "StartOS Electrs did not synchronize on signet"
+    fi
+    # Keep the wrapper/PATH patch applied across package crash restarts.
+    patch_electrs_package_path_env 2>/dev/null || true
+    install_signet_electrs_wrapper 2>/dev/null || true
+    sleep 10; waited=$((waited+10))
+  done
+  verify_runtime
 }
 
 stop_all() {

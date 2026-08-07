@@ -228,15 +228,72 @@ mount_overlay() {
     fail "Fulcrum overlay did not propagate into its package LXC"
 }
 
+# Official Fulcrum package schema has no network key and pins
+# rpccookie=/mnt/bitcoind/.cookie. Inject a PATH wrapper that forces
+# network=signet and a signet cookie path before exec'ing the real binary.
 apply_signet_fulcrum_contract() {
   local conf="$PRIVATE/fulcrum.conf"
   [[ -f "$conf" ]] || fail "Fulcrum configuration missing at $conf"
-  chattr -i "$conf" 2>/dev/null || true
-  sed -i -E '/^[[:space:]]*(datadir|network)[[:space:]]*=/d' "$conf"
+  sed -i -E '/^[[:space:]]*(datadir|network|rpccookie)[[:space:]]*=/d' "$conf"
   printf '\n# bitcoin-vm-lab consumer contract\ndatadir=/data\nnetwork=signet\n' >>"$conf"
+  if [[ -e /media/bvml-startos-overlay/signet/.cookie ]] ||
+     [[ -e /media/startos/data/package-data/volumes/bitcoind/data/main/signet/.cookie ]]; then
+    printf 'rpccookie=/mnt/bitcoind/signet/.cookie\n' >>"$conf"
+  else
+    printf 'rpccookie=/mnt/bitcoind/.cookie\n' >>"$conf"
+  fi
   grep -Eqi '^[[:space:]]*network[[:space:]]*=[[:space:]]*signet([[:space:]]|$)' "$conf" ||
     fail "failed to pin Fulcrum network=signet"
-  chattr +i "$conf" 2>/dev/null || true
+}
+
+install_signet_fulcrum_wrapper() {
+  install -d -m 0755 "$PRIVATE/bin"
+  cat >"$PRIVATE/bin/Fulcrum" <<'WRAP'
+#!/bin/bash
+# bitcoin-vm-lab: force signet for the official StartOS Fulcrum package
+set -euo pipefail
+conf=/data/fulcrum.conf
+if [[ -f "$conf" ]]; then
+  sed -i -E '/^[[:space:]]*(datadir|network|rpccookie)[[:space:]]*=/d' "$conf"
+  printf '\ndatadir=/data\nnetwork=signet\n' >>"$conf"
+  if [[ -f /mnt/bitcoind/signet/.cookie ]]; then
+    printf 'rpccookie=/mnt/bitcoind/signet/.cookie\n' >>"$conf"
+  else
+    printf 'rpccookie=/mnt/bitcoind/.cookie\n' >>"$conf"
+  fi
+fi
+# Prefer the real binary; package image ships Fulcrum on PATH under /usr.
+if [[ -x /usr/bin/Fulcrum ]]; then
+  exec /usr/bin/Fulcrum "$@"
+fi
+if [[ -x /usr/local/bin/Fulcrum ]]; then
+  exec /usr/local/bin/Fulcrum "$@"
+fi
+# Fall back to PATH lookup excluding /data/bin to avoid recursion.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+exec Fulcrum "$@"
+WRAP
+  chmod 0755 "$PRIVATE/bin/Fulcrum"
+}
+
+# Fulcrum package image id is "main" (see fulcrum-startos main.ts).
+patch_fulcrum_package_path_env() {
+  local envfile="/var/lib/lxc/$LXC/rootfs/media/startos/images/main.env" path_line
+  [[ -n "${LXC:-}" && -d "/var/lib/lxc/$LXC/rootfs" ]] ||
+    fail "Fulcrum package LXC is unavailable for PATH patch"
+  path_line='PATH=/data/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  if [[ -f "$envfile" ]]; then
+    if grep -Eq '^PATH=' "$envfile"; then
+      sed -i -E "s|^PATH=.*|$path_line|" "$envfile"
+    else
+      printf '%s\n' "$path_line" | cat - "$envfile" >"$envfile.new"
+      mv -f -- "$envfile.new" "$envfile"
+    fi
+  else
+    printf '%s\n' "$path_line" >"$envfile"
+  fi
+  grep -Eq '^PATH=/data/bin:' "$envfile" ||
+    fail "failed to patch Fulcrum package PATH for signet wrapper"
 }
 
 seed_overlay() {
@@ -245,10 +302,10 @@ seed_overlay() {
   db="$PRIVATE/$layout"
   [[ -d "$db" && -n "$(find "$db" -mindepth 1 -print -quit)" ]] ||
     fail "StartOS Fulcrum overlay lacks reusable database at $db (base was not attached)"
-  chattr -i "$PRIVATE/fulcrum.conf" 2>/dev/null || true
   install -m 0600 "$SEED/fulcrum.conf" "$PRIVATE/fulcrum.conf"
   install -m 0600 "$SEED/store.json" "$PRIVATE/store.json"
   apply_signet_fulcrum_contract
+  install_signet_fulcrum_wrapper
   jq --arg db "$db" --arg layout "$layout" \
     '.services.fulcrum + {startos_index_profile_sha256:"'"$INDEX_SHA"'",
       database_path:$db,database_layout:$layout,reused_existing_database:true}' \
@@ -349,16 +406,18 @@ verify_runtime() {
 setup() {
   load_profiles; package_stopped || { start-cli package stop "$PACKAGE"; wait_status stopped; }
   mount_overlay; seed_overlay
+  patch_fulcrum_package_path_env
   # --force: allow start while a prior critical task (e.g. bitcoind txindex
   # verification) is still recorded; runtime verify still requires Electrum OK.
   start-cli package start "$PACKAGE" --force; wait_status running
-  if ! grep -Eqi '^[[:space:]]*network[[:space:]]*=[[:space:]]*signet([[:space:]]|$)' \
-       "$PRIVATE/fulcrum.conf" 2>/dev/null; then
-    apply_signet_fulcrum_contract
-    start-cli package restart "$PACKAGE" --force 2>/dev/null ||
-      start-cli package restart "$PACKAGE"
-    wait_status running
-  fi
+  patch_fulcrum_package_path_env
+  install_signet_fulcrum_wrapper
+  apply_signet_fulcrum_contract
+  start-cli package restart "$PACKAGE" --force 2>/dev/null ||
+    start-cli package restart "$PACKAGE"
+  wait_status running
+  patch_fulcrum_package_path_env
+  install_signet_fulcrum_wrapper
   apply_signet_fulcrum_contract
   local waited=0
   while ! ( verify_runtime >/dev/null 2>"$STATE/fulcrum-verify.err" ); do
@@ -366,11 +425,15 @@ setup() {
       cat "$STATE/fulcrum-verify.err" >&2
       fail "StartOS Fulcrum did not synchronize"
     fi
-    apply_signet_fulcrum_contract
+    patch_fulcrum_package_path_env 2>/dev/null || true
+    install_signet_fulcrum_wrapper 2>/dev/null || true
+    apply_signet_fulcrum_contract 2>/dev/null || true
     sleep 10; waited=$((waited+10))
   done
   start-cli package restart "$PACKAGE" --force 2>/dev/null || start-cli package restart "$PACKAGE"
   wait_status running
+  patch_fulcrum_package_path_env
+  install_signet_fulcrum_wrapper
   apply_signet_fulcrum_contract
   waited=0
   while ! ( verify_runtime >/dev/null 2>"$STATE/fulcrum-verify.err" ); do
@@ -378,7 +441,9 @@ setup() {
       cat "$STATE/fulcrum-verify.err" >&2
       fail "StartOS Fulcrum did not stay ready after restart"
     fi
-    apply_signet_fulcrum_contract
+    patch_fulcrum_package_path_env 2>/dev/null || true
+    install_signet_fulcrum_wrapper 2>/dev/null || true
+    apply_signet_fulcrum_contract 2>/dev/null || true
     sleep 10; waited=$((waited+10))
   done
   verify_runtime
