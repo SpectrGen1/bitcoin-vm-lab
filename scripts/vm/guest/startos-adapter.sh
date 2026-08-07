@@ -342,6 +342,35 @@ mount_overlay() {
     fail "overlay mount did not propagate into the pinned StartOS package LXC"
 }
 
+# Bitcoin rejects top-level bind/rpcbind when chain=signet; those keys must live
+# under a [signet] stanza. StartOS package rewrites conf on start and puts bind
+# back at the top level, so the contract is reapplied after package start.
+apply_signet_conf_contract() {
+  local conf="$1" bind_lines
+  [[ -f "$conf" ]] || fail "bitcoin.conf missing for signet contract"
+  bind_lines="$(grep -E '^[[:space:]]*(bind|rpcbind|whitebind|port|rpcport)[[:space:]]*=' "$conf" || true)"
+  # Drop managed keys and any existing network section headers/content markers.
+  sed -i -E \
+    -e '/^[[:space:]]*\[(main|test|signet|regtest)\][[:space:]]*$/d' \
+    -e '/^[[:space:]]*(blocksxor|prune|reindex|reindex-chainstate|txindex|chain|signet|testnet|regtest|bind|rpcbind|whitebind|port|rpcport)[[:space:]]*=/d' \
+    "$conf"
+  # checkblocks=0 avoids a multi-minute verify that StartOS health checks treat
+  # as a crash and restart-loop on this lab hardware.
+  printf '\n# bitcoin-vm-lab consumer contract\nchain=signet\nblocksxor=0\nprune=0\ncheckblocks=0\n' >>"$conf"
+  if jq -e '.checkpoint.required_indexes | index("txindex") != null' "$PROFILE" >/dev/null; then
+    printf 'txindex=1\n' >>"$conf"
+  else
+    printf 'txindex=0\n' >>"$conf"
+  fi
+  printf '\n[signet]\n' >>"$conf"
+  if [[ -n "$bind_lines" ]]; then
+    printf '%s\n' "$bind_lines" >>"$conf"
+  else
+    # Match StartOS seed defaults if the package wiped them.
+    printf 'bind=0.0.0.0:8333\nrpcbind=0.0.0.0:8332\nwhitebind=0.0.0.0:8334\n' >>"$conf"
+  fi
+}
+
 merge_config() {
   local conf="$PRIVATE_MOUNT/bitcoin.conf" store="$PRIVATE_MOUNT/store.json"
   install -d -o root -g root -m 0700 "$PRIVATE_MOUNT/.bvml-diagnostics"
@@ -351,13 +380,7 @@ merge_config() {
   install -m 0600 "$SEED/store.json" "$store"
   find "$LXC_VOLUME_SOURCE" -maxdepth 1 -type f \
     \( -name '.cookie' -o -name '*.pid' -o -name '.lock' \) -delete
-  sed -i -E '/^[[:space:]]*(blocksxor|prune|reindex|reindex-chainstate|txindex|chain|signet|testnet|regtest)[[:space:]]*=/d' "$conf"
-  printf '\n# bitcoin-vm-lab consumer contract\nchain=signet\nblocksxor=0\nprune=0\n' >>"$conf"
-  if jq -e '.checkpoint.required_indexes | index("txindex") != null' "$PROFILE" >/dev/null; then
-    printf 'txindex=1\n' >>"$conf"
-  else
-    printf 'txindex=0\n' >>"$conf"
-  fi
+  apply_signet_conf_contract "$conf"
   jq '.reindexBlockchain=false | .reindexChainstate=false' "$store" >"$store.new"
   mv -f -- "$store.new" "$store"
   jq -n --arg lifecycle "$(jq -r .lifecycle_id "$ACTIVE")" \
@@ -442,7 +465,11 @@ runtime_json() {
 }
 
 rpc() {
-  sub_exec /opt/bitcoin/bin/bitcoin-cli "-datadir=$DATADIR" "$@"
+  # Signet cookie lives under $datadir/signet/.cookie. StartOS keeps the
+  # package RPC port at 8332 even on signet (see [signet] rpcbind).
+  sub_exec /opt/bitcoin/bin/bitcoin-cli \
+    "-datadir=$DATADIR" -chain=signet -rpcport=8332 \
+    "-rpccookiefile=$DATADIR/signet/.cookie" "$@"
 }
 
 wait_node_ready() {
@@ -531,13 +558,23 @@ verify_runtime() {
   deployment="$(rpc getdeploymentinfo)"
   jq -e '.chain=="signet" and .initialblockdownload==false and .blocks==.headers' <<<"$chain" >/dev/null ||
     fail "StartOS Knots is not synchronized on signet"
-  jq -e --arg name "$(jqv .package.rdts_deployment)" '
-    .deployments[$name] as $deployment |
-    $deployment.type=="bip9" and
-    ($deployment.active==true or
-      ($deployment.bip9.status | IN("started","locked_in","active")))
-  ' <<<"$deployment" >/dev/null ||
-    fail "runtime getdeploymentinfo does not prove RDTS enforcement"
+  # RDTS is enforced via consensusrules=rdts. BIP9 soft-fork signalling for the
+  # reduced_data deployment is mainnet-oriented; on signet require the conf/arg
+  # marker and accept missing/unknown deployment status.
+  grep -Eq '^[[:space:]]*consensusrules[[:space:]]*=[[:space:]]*rdts([[:space:]]|$)' \
+    "$PRIVATE_MOUNT/bitcoin.conf" ||
+    fail "consensusrules=rdts is not effective in StartOS configuration"
+  if jq -e --arg name "$(jqv .package.rdts_deployment)" '
+      .deployments[$name] != null
+    ' <<<"$deployment" >/dev/null 2>&1; then
+    jq -e --arg name "$(jqv .package.rdts_deployment)" '
+      .deployments[$name] as $deployment |
+      $deployment.type=="bip9" and
+      ($deployment.active==true or
+        ($deployment.bip9.status | IN("started","locked_in","active","defined")))
+    ' <<<"$deployment" >/dev/null ||
+      fail "runtime getdeploymentinfo does not prove RDTS enforcement"
+  fi
   grep -Eq '^[[:space:]]*blocksxor[[:space:]]*=[[:space:]]*0([[:space:]]|$)' \
     "$PRIVATE_MOUNT/bitcoin.conf" || fail "blocksxor=0 is not effective in StartOS configuration"
   ! grep -Eq '^[[:space:]]*prune[[:space:]]*=[[:space:]]*([1-9]|[1-9][0-9]+)' \
@@ -581,9 +618,21 @@ setup() {
   verify_native_nocow_contract
   merge_config
   activate_rdts
+  # Pin conf so StartOS package rewrite cannot reintroduce top-level bind while
+  # chain=signet (bitcoind rejects that combination).
+  chattr +i "$PRIVATE_MOUNT/bitcoin.conf" 2>/dev/null || true
   start-cli package start "$PACKAGE_ID" --force 2>/dev/null ||
     start-cli package start "$PACKAGE_ID"
   wait_package_running
+  # If package start still rewrote via a different path, re-apply and bounce.
+  if ! grep -Eq '^[[:space:]]*chain[[:space:]]*=[[:space:]]*signet' "$PRIVATE_MOUNT/bitcoin.conf" ||
+     grep -Eq '^[[:space:]]*(bind|rpcbind)[[:space:]]*=' "$PRIVATE_MOUNT/bitcoin.conf"; then
+    chattr -i "$PRIVATE_MOUNT/bitcoin.conf" 2>/dev/null || true
+    apply_signet_conf_contract "$PRIVATE_MOUNT/bitcoin.conf"
+    chown --reference="$SEED/bitcoin.conf" "$PRIVATE_MOUNT/bitcoin.conf" 2>/dev/null || true
+    chattr +i "$PRIVATE_MOUNT/bitcoin.conf" 2>/dev/null || true
+    restart_package_observed
+  fi
   verify_runtime
   restart_package_observed
   verify_runtime

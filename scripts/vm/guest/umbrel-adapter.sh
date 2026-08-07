@@ -15,6 +15,18 @@ TIMEOUT="${UMBREL_OPERATION_TIMEOUT:-1200}"
 fail() { echo "error: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || fail "missing guest command: $1"; }
 jqv() { jq -er "$1" "$PROFILE"; }
+# Umbrel Knots keeps a custom RPC port (9332) even on signet; cookie lives under
+# the network subdirectory when chain!=main.
+knots_cli() {
+  local cid="$1"; shift
+  local rpc_port="${APP_BITCOIN_KNOTS_RPC_PORT:-${APP_BITCOIN_RPC_PORT:-9332}}"
+  docker exec "$cid" bitcoin-cli \
+    "-datadir=$CONTAINER_DATADIR" \
+    -chain=signet \
+    "-rpcport=$rpc_port" \
+    "-rpccookiefile=$CONTAINER_DATADIR/signet/.cookie" \
+    "$@"
+}
 
 load_profile() {
   need jq; need sha256sum; need umbreld; need docker
@@ -227,8 +239,7 @@ wait_knots_ready() {
     if [[ -n "$cid" ]]; then
       pid="$(actual_knots_pid "$cid" 2>/dev/null || true)"
       if [[ -n "$pid" ]] &&
-         docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
-           "-rpcport=$APP_BITCOIN_KNOTS_RPC_PORT" \
+         knots_cli "$cid" \
            getblockchaininfo >/dev/null 2>&1; then
         return 0
       fi
@@ -244,10 +255,8 @@ wait_checkpoint_ready() {
   while (( waited < TIMEOUT )); do
     cid="$(container_id 2>/dev/null || true)"
     if [[ -n "$cid" ]]; then
-      chain="$(docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
-        "-rpcport=$APP_BITCOIN_KNOTS_RPC_PORT" getblockchaininfo 2>/dev/null || true)"
-      indexes="$(docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
-        "-rpcport=$APP_BITCOIN_KNOTS_RPC_PORT" getindexinfo 2>/dev/null || true)"
+      chain="$(knots_cli "$cid" getblockchaininfo 2>/dev/null || true)"
+      indexes="$(knots_cli "$cid" getindexinfo 2>/dev/null || true)"
       if jq -e --argjson minimum "$(jq -r .expected_minimum_height "$ACTIVE")" '
           .chain=="signet" and .initialblockdownload==false and
           .blocks==.headers and .blocks >= $minimum
@@ -288,8 +297,7 @@ prepared() {
     .checkpoint_generation==$active.checkpoint_generation and
     .filesystem_uuid==$active.filesystem_uuid
   ' "$DATADIR/.bvml-overlay.json" >/dev/null || fail "overlay marker does not match host identity"
-  chain="$(docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
-    "-rpcport=$APP_BITCOIN_KNOTS_RPC_PORT" getblockchaininfo)"
+  chain="$(knots_cli "$cid" getblockchaininfo)"
   jq -n --arg container "$cid" --arg pid "$pid" --arg digest "$digest" \
     --argjson args "$args" --argjson chain "$chain" \
     '{prepared:true,container_id:$container,knots_pid:$pid,
@@ -437,8 +445,7 @@ verify_runtime() {
       ! od -An -v -tu1 "$1/signet/blocks/xor.dat" | tr -s " " "\n" | sed "/^$/d" | grep -qv "^0$"
     ' sh "$CONTAINER_DATADIR" || fail "block storage is XOR encoded"
   fi
-  chain="$(docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
-    "-rpcport=$APP_BITCOIN_KNOTS_RPC_PORT" getblockchaininfo)"
+  chain="$(knots_cli "$cid" getblockchaininfo)"
   logs="$(docker logs "$cid" 2>&1 | tail -4000)"
   grep -Eqi 'consensusrules.*rdts|Setting.*consensusrules.*rdts' <<<"$logs" ||
     fail "startup logs do not prove the effective RDTS configuration"
@@ -451,15 +458,13 @@ verify_runtime() {
   now="$(date +%s)"; tip_age=$((now - $(jq -r .time <<<"$chain")))
   (( tip_age >= 0 && tip_age <= $(jqv .runtime.max_tip_age_seconds) )) ||
     fail "chain tip is too old: ${tip_age}s"
-  indexes="$(docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
-    "-rpcport=$APP_BITCOIN_KNOTS_RPC_PORT" getindexinfo)"
+  indexes="$(knots_cli "$cid" getindexinfo)"
   jq -e --argjson expected "$(jq '.knots.required_indexes' "$PROFILE")" '
     . as $actual |
     all($expected[]; . as $name |
       ($actual | has($name)) and $actual[$name].synced==true)
   ' <<<"$indexes" >/dev/null || fail "required checkpoint indexes are missing or unsynchronized"
-  zmq="$(docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
-    "-rpcport=$APP_BITCOIN_KNOTS_RPC_PORT" getzmqnotifications)"
+  zmq="$(knots_cli "$cid" getzmqnotifications)"
   [[ "$(jq 'map(.type)|unique|length' <<<"$zmq")" -ge 5 ]] ||
     fail "required Umbrel ZMQ publishers are not active"
   docker exec "$cid" node -e \
