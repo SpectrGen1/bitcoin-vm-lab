@@ -6,14 +6,31 @@ case "$cmd" in
   host-setup) exec "$ROOT/scripts/host/setup-gentoo.sh" "$@" ;;
   host-validate) exec "$ROOT/scripts/host/validate-gentoo.sh" "$@" ;;
   credentials-init)
-    [[ "${1:-}" == umbrel && $# == 1 ]] || { echo "usage: bvml credentials-init umbrel" >&2; exit 64; }
-    shift
-    exec "$ROOT/scripts/umbrel-credentials-init.sh" "$@" ;;
-  media-fetch|profiles-install|storage-prepare|guest-provision|guest-repair)
+    case "${1:-}" in
+      umbrel) shift; exec "$ROOT/scripts/umbrel-credentials-init.sh" "$@" ;;
+      startos) shift; exec "$ROOT/scripts/startos-credentials-init.sh" "$@" ;;
+      *) echo "usage: bvml credentials-init {umbrel|startos}" >&2; exit 64 ;;
+    esac ;;
+  media-fetch|profiles-install|profiles-migrate|storage-prepare|guest-provision|guest-repair|guest-index-provision)
     exec "$ROOT/scripts/provision.sh" "$cmd" "$@" ;;
   create-cleanup) exec "$ROOT/scripts/vm/create-cleanup.sh" "$@" ;;
-  init|create|start|stop|discard|reset|reconcile|checkpoint-bootstrap|bootstrap-init|bootstrap-stop|bootstrap-verify|bootstrap-promote|bootstrap-cleanup|bootstrap-status|checkpoint-import|checkpoint-verify|checkpoint-promote|checkpoint-protect|checkpoint-rollback|rollback-remove|recovery-ack|adapter-setup|adapter-validate|adapter-status|validate|status)
+  startos-adapter-build) exec "$ROOT/scripts/vm/startos-btrfs-layer.sh" build "$@" ;;
+  startos-adapter-resume) exec "$ROOT/scripts/vm/startos-btrfs-layer.sh" resume "$@" ;;
+  startos-adapter-validate) exec "$ROOT/scripts/vm/startos-btrfs-layer.sh" validate "$@" ;;
+  startos-adapter-status) exec "$ROOT/scripts/vm/startos-btrfs-layer.sh" status "$@" ;;
+  startos-adapter-cleanup) exec "$ROOT/scripts/vm/startos-btrfs-layer.sh" cleanup "$@" ;;
+  startos-adapter-remove) exec "$ROOT/scripts/vm/startos-btrfs-layer.sh" remove "$@" ;;
+  index-bootstrap) exec "$ROOT/scripts/vm/indexes.sh" bootstrap-create "$@" ;;
+  index-bootstrap-init) exec "$ROOT/scripts/vm/indexes.sh" bootstrap-init "$@" ;;
+  index-bootstrap-start) exec "$ROOT/scripts/vm/indexes.sh" bootstrap-start "$@" ;;
+  index-bootstrap-verify) exec "$ROOT/scripts/vm/indexes.sh" bootstrap-verify "$@" ;;
+  index-bootstrap-promote) exec "$ROOT/scripts/vm/indexes.sh" bootstrap-promote "$@" ;;
+  index-prepare) exec "$ROOT/scripts/vm/indexes.sh" prepare "$@" ;;
+  index-discard) exec "$ROOT/scripts/vm/indexes.sh" discard "$@" ;;
+  index-status) exec "$ROOT/scripts/vm/indexes.sh" status "$@" ;;
+  init|create|create-resume|start|resume|stop|discard|reset|reconcile|checkpoint-bootstrap|bootstrap-init|bootstrap-stop|bootstrap-verify|bootstrap-promote|bootstrap-cleanup|bootstrap-status|checkpoint-import|checkpoint-sync-start|checkpoint-profile-migrate-guest|checkpoint-sync-finish|checkpoint-verify|checkpoint-promote|checkpoint-commit|checkpoint-protect|checkpoint-rollback|rollback-remove|recovery-ack|adapter-setup|adapter-validate|adapter-status|index-adapter-setup|index-adapter-validate|validate|status)
     exec "$ROOT/scripts/vm/manage.sh" "$cmd" "$@" ;;
+  info) exec "$ROOT/scripts/vm/info.sh" "$@" ;;
   test) exec "$ROOT/tests/run.sh" "$@" ;;
   integration-test) exec "$ROOT/tests/integration/run.sh" "$@" ;;
   help|-h|--help)
@@ -21,21 +38,48 @@ case "$cmd" in
 Commands:
   host-validate                  verify KVM, libvirt, UEFI, and storage access
   host-setup                     install/configure minimal Gentoo prerequisites
-  credentials-init umbrel        generate protected onboarding credentials and SSH key
+  credentials-init {umbrel|startos}
+                                 generate protected onboarding credentials and SSH key
   init                           initialize system-libvirt storage
-  media-fetch {ubuntu|umbrel}    stage and structurally verify pinned media
+  media-fetch {ubuntu|umbrel|startos}
+                                 stage and structurally verify pinned media
   profiles-install              verify/install signed Knots and RDTS profiles
+  profiles-migrate --confirm-checkpoint-migration
+                                 install an explicit profile for a retained Ubuntu update
   storage-prepare               initialize storage and verify QEMU traversal
   create VM                      create a persistent VM from a verified ISO
                                  or unattended pinned Ubuntu cloud image
   create-cleanup VM --confirm-remove-partial
                                  remove only known disks from a failed undefined VM creation
-  guest-provision {ubuntu|umbrel}
+  create-resume startos           safely resume a pinned, attached StartOS installer
+  guest-provision {ubuntu|umbrel|startos}
                                  provision verified guest assets/native app
                                  (refuses any active Bitcoin lifecycle)
-  guest-repair {ubuntu|umbrel} --scripts-only
+  guest-repair {ubuntu|umbrel|startos} --scripts-only
                                  update lifecycle scripts only after proving
                                  guest profile digests remain unchanged
+  guest-index-provision VM       install pinned Electrs/Fulcrum integration assets
+  startos-adapter-build --confirm-convert
+                                 convert a canonical-backed layer from ext4 to Btrfs
+  startos-adapter-resume --confirm-resume
+                                 resume a validated conversion after interruption
+  startos-adapter-validate       validate the protected StartOS Btrfs layer
+  startos-adapter-status         report its allocation and backing chain
+  startos-adapter-cleanup --confirm-remove-candidate
+                                 recover an interrupted conversion before installation
+  startos-adapter-remove --confirm-remove
+                                 remove an obsolete adapter before canonical replacement
+  index-bootstrap {electrs|fulcrum}
+                                 create an incomplete reusable index image
+  index-bootstrap-init SERVICE --confirm-index-format
+                                 explicitly format the identified index bootstrap
+  index-bootstrap-start SERVICE  start the pinned indexer in Ubuntu
+  index-bootstrap-verify SERVICE verify synchronization and stop it cleanly
+  index-bootstrap-promote SERVICE --confirm-index-synced
+                                 protect the synchronized reusable index base
+  index-prepare VM               create missing per-service consumer overlays
+  index-discard VM               discard only that VM's stopped index overlays
+  index-status                   report index bases and consumer overlays
   checkpoint-bootstrap           create/attach empty fresh-IBD disk to Ubuntu
   bootstrap-init --confirm-bootstrap-format
                                  explicitly initialize the bootstrap filesystem
@@ -47,15 +91,22 @@ Commands:
   bootstrap-status               report fresh-IBD/bootstrap lifecycle state
   checkpoint-import SOURCE (--assert-source-stopped|--consistent-snapshot) --assert-mainnet
                                  optionally import a compatible explicit source
-  start VM                       create, attach, and boot one fresh overlay
+  checkpoint-sync-start          configure/start Ubuntu Knots on its update overlay
+  checkpoint-profile-migrate-guest
+                                 install the explicit active profile in Ubuntu
+  checkpoint-sync-finish         verify Knots, stop Ubuntu, detach, and retain update
+  start VM                       create, attach, and boot that VM's fresh overlay
+  resume VM                      attach and boot that VM's retained overlays
   start VM --adapter-setup       explicit first-run mode for unverified platform adapter
   stop VM                        cleanly stop, detach, and retain the overlay
-  discard [VM]                   discard the inactive overlay
+  discard VM                     discard that VM's inactive overlay
   reset VM                       stop if necessary, then discard the overlay
-  reconcile                      clear provably stale inactive owner metadata
+  reconcile [VM]                 reconcile one or all per-VM lifecycles
   checkpoint-verify              extract stopped Ubuntu Knots verification
   checkpoint-promote --confirm-synced-clean
                                  promote a verified Ubuntu Knots/RDTS overlay
+  checkpoint-commit --confirm-no-rollback
+                                 commit a verified update in place under no-backup policy
   checkpoint-protect             restore canonical protection
   checkpoint-rollback            atomically restore the rollback checkpoint
   rollback-remove --confirm-remove
@@ -65,8 +116,11 @@ Commands:
   adapter-status [VM]            inspect supported guest adapter configuration
   adapter-setup VM               invoke exact package adapter through guest agent
   adapter-validate VM            verify actual managed package/container usage
+  index-adapter-setup VM         mount/start the selected VM's native Electrum index apps
+  index-adapter-validate VM      prove live index app, database, and overlay identity
   validate                       run full state and host validation
   status                         concise checkpoint/overlay/domain safety report
+  info [VM]                      IPs, consoles, dashboards, and login credentials
   test                           run mocked lifecycle tests
   integration-test STEP          opt-in real-host suite; requires dedicated
                                  marked storage and explicit environment guard

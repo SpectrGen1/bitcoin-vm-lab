@@ -4,11 +4,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "$ROOT/lib/common.sh"
 command="${1:?command required}"; shift
 
-target_for_source() {
-  local vm="$1" source="$2"
-  virshq domblklist "$(domain "$vm")" --details 2>/dev/null |
-    awk -v wanted="$source" 'NR>2 && $4 == wanted {print $3; exit}'
-}
+source "$ROOT/lib/index-lifecycle.sh"
 
 detach_image() {
   local vm="$1" image="$2" target
@@ -27,36 +23,28 @@ write_owner_record() {
   return 0
 }
 
-assert_overlay_chain() {
-  [[ -f "$OVERLAY" && -f "$OVERLAY_META" ]] || die "active overlay or manifest is missing"
-  [[ "$(meta_get "$OVERLAY_META" backing)" == "$CANONICAL" ]] || die "overlay manifest backing path is invalid"
-  [[ "$(meta_get "$OVERLAY_META" canonical_id)" == "$(canonical_id)" ]] ||
-    die "overlay survived a checkpoint replacement; discard it"
-  [[ "$(meta_get "$OVERLAY_META" checkpoint_generation)" == "$(checkpoint_generation)" ]] ||
-    die "overlay checkpoint generation does not match the canonical checkpoint"
-  [[ -n "$(overlay_id)" ]] || die "overlay manifest lacks a unique overlay ID"
-  local backing
-  backing="$(qemu-img info --output=json "$OVERLAY" | sed -n 's/.*"backing-filename":[[:space:]]*"\([^"]*\)".*/\1/p')"
-  [[ "$backing" == "$CANONICAL" ]] || die "overlay qcow2 backing is '$backing', expected '$CANONICAL'"
-}
-
 assert_consistent_owner() {
   assert_lifecycle_invariants
 }
 
 transactional_attach_start() {
-  local kind="$1" vm="$2" image meta identity serial nonce size_bytes
+  local kind="$1" vm="$2" image meta identity serial nonce size_bytes backing
   case "$kind" in
     overlay)
       image="$OVERLAY"; meta="$OVERLAY_META"; identity="$(new_id)"
       serial="BVMLO-${identity:0:12}"
-      qemu-img create -f qcow2 -F qcow2 -b "$CANONICAL" "$image" ||
+      backing="$(backing_image_for_vm "$vm")"
+      qemu-img create -f qcow2 -F qcow2 -b "$backing" "$image" ||
         die "overlay creation failed"
       write_env_file "$meta" \
         "kind=overlay" "vm=$vm" "canonical_id=$(canonical_id)" "created=$(date -u +%FT%TZ)" \
-        "backing=$CANONICAL" "overlay_id=$identity" "checkpoint_generation=$(checkpoint_generation)" \
-        "size_bytes=$(qemu-img info --output=json "$CANONICAL" | jq -r '.["virtual-size"]')" \
-        "disk_serial=$serial"
+        "backing=$backing" "overlay_id=$identity" "checkpoint_generation=$(checkpoint_generation)" \
+        "size_bytes=$(qemu-img info --output=json "$backing" | jq -r '.["virtual-size"]')" \
+        "disk_serial=$serial" "owner_state=creating" "attachment_state=detached" \
+        "mount_state=unmounted" "adapter_state=pending" "recovery_required=0"
+      if [[ "$vm" == startos ]]; then
+        meta_set "$meta" startos_adapter_id "$(meta_get "$STARTOS_LAYER_META" id)"
+      fi
       ;;
     bootstrap)
       image="$BOOTSTRAP"; meta="$BOOTSTRAP_META"; identity="$(new_id)"
@@ -84,6 +72,7 @@ transactional_attach_start() {
     rm -f -- "$image" "$meta"
     die "$kind attachment failed; image and manifest rolled back"
   fi
+  meta_set "$meta" attachment_state attached
   if [[ "$(attached_vm_for_path "$image" | paste -sd, -)" != "$vm" ||
         "$(attachment_serial_for_path "$vm" "$image")" != "$serial" ]]; then
     if detach_image "$vm" "$image" && [[ -z "$(attached_vm_for_path "$image")" ]]; then
@@ -96,8 +85,18 @@ transactional_attach_start() {
         "vm=$vm" "image=$image" "identity=$identity" "disk_serial=$serial"
     die "$kind attachment identity verification failed and detach failed; recoverable state was retained"
   fi
+  if [[ "$kind" == overlay ]] && ! attach_retained_indexes "$vm"; then
+    rollback_index_attachments "$vm"
+    detach_image "$vm" "$image" || true
+    [[ -z "$(attached_vm_for_path "$image")" ]] ||
+      die "$kind index attachment failed and Bitcoin detach failed; state retained"
+    assert_no_process_reference "$image"
+    rm -f -- "$image" "$meta"
+    die "$kind index attachment failed; all attachments and new Bitcoin state rolled back"
+  fi
   if ! write_owner_record "$kind" "$vm" "$image" "$identity" "$serial"; then
     local original="$kind owner metadata write failed"
+    [[ "$kind" != overlay ]] || rollback_index_attachments "$vm"
     detach_image "$vm" "$image" ||
       die "$original; detach also failed, so image and manifest were retained"
     [[ -z "$(attached_vm_for_path "$image")" ]] ||
@@ -106,8 +105,10 @@ transactional_attach_start() {
     rm -f -- "$image" "$meta"
     die "$original; attachment, image, and manifest rolled back"
   fi
+  meta_set "$meta" owner_state active
   if ! virshq start "$(domain "$vm")"; then
     if is_shut_off "$vm"; then
+      rollback_index_attachments "$vm"
       detach_image "$vm" "$image" || die "VM start failed and detach failed; state retained"
       [[ -z "$(attached_vm_for_path "$image")" ]] ||
         die "VM start failed and domain XML still references image; state retained"
@@ -121,17 +122,21 @@ transactional_attach_start() {
 
 start_vm() {
   local vm="$1" mode="${2:-}"
+  set_lifecycle_context "$vm"
   valid_vm "$vm"; need qemu-img; need virsh
   [[ -z "$mode" || "$mode" == --adapter-setup ]] || die "unsupported start option: $mode"
   if [[ "$vm" != ubuntu ]]; then
     if [[ "$mode" == --adapter-setup ]]; then
       note "$vm is entering explicit unverified adapter-setup mode"
     else
-      jq -e --arg platform "$vm" --arg umbrel_profile "${UMBREL_PROFILE_SHA256,,}" '
+      jq -e --arg platform "$vm" --arg umbrel_profile "${UMBREL_PROFILE_SHA256,,}" \
+        --arg startos_profile "${STARTOS_PROFILE_SHA256,,}" '
         .platform == $platform and
         (.last_validation_result == "ok" or
           ($platform == "umbrel" and .provisioning_result == "ok" and
-           .profile_digest == $umbrel_profile))
+           .profile_digest == $umbrel_profile) or
+          ($platform == "startos" and .provisioning_result == "ok" and
+           .profile_digest == $startos_profile))
       ' \
         "$ADAPTER_STATE_DIR/$vm.json" >/dev/null 2>&1 ||
         die "$vm adapter is not provisioned; run guest-provision or use explicit adapter-setup recovery mode"
@@ -139,35 +144,248 @@ start_vm() {
   elif [[ -n "$mode" ]]; then
     die "--adapter-setup is only valid for UmbrelOS or StartOS"
   fi
+  exec 7>"$GLOBAL_LOCK_FILE"
+  flock -n 7 || die "canonical state is being changed; retry $vm start"
   canonical_preflight; is_defined "$vm" || die "VM is not defined: $vm"
-  all_shut_off
+  [[ "$vm" != startos ]] || startos_adapter_preflight
+  is_shut_off "$vm" || die "$(domain "$vm") is $(domain_state "$vm"); exact 'shut off' required"
   [[ -e "$OVERLAY" || -e "$OVERLAY_META" ]] || rm -f -- "$VERIFY_META"
-  assert_consistent_owner; assert_no_extra_overlays
-  [[ ! -e "$OVERLAY" && ! -e "$OVERLAY_META" && ! -e "$BOOTSTRAP" && ! -e "$BOOTSTRAP_META" ]] ||
-    die "Bitcoin working state is retained; discard, clean up, or promote it first"
-  assert_no_bitcoin_attachments
+  [[ ! -e "$OVERLAY" && ! -e "$OVERLAY_META" && ! -e "$OWNER_FILE" &&
+     ! -e "$ADAPTER_RECOVERY_META" ]] ||
+    die "$vm Bitcoin lifecycle state is retained; discard or reconcile it first"
+  [[ ! -e "$BOOTSTRAP" && ! -e "$BOOTSTRAP_META" ]] ||
+    die "fresh checkpoint bootstrap state blocks ordinary consumer startup"
+  [[ "$(all_attached_pairs | awk -F '\t' -v vm="$vm" '$1 == vm {n++} END {print n+0}')" == 0 ]] ||
+    die "$vm already has a Bitcoin storage attachment"
+  assert_no_extra_overlays
+  prepare_missing_index_overlays "$vm"
   transactional_attach_start overlay "$vm"
-  note "$vm started with the single disposable overlay"
+  flock -u 7
+  note "$vm started with its disposable overlay"
+}
+
+resume_vm() {
+  local vm="$1" mode="${2:-}"
+  valid_vm "$vm"; set_lifecycle_context "$vm"
+  [[ -z "$mode" || "$mode" == --adapter-setup ]] ||
+    die "unsupported resume option: $mode"
+  canonical_preflight
+  [[ -f "$OVERLAY" && -f "$OVERLAY_META" && ! -e "$OWNER_FILE" ]] ||
+    die "$vm requires one detached retained Bitcoin overlay and no owner record"
+  is_defined "$vm" && is_shut_off "$vm" ||
+    die "$vm must be defined and exactly shut off"
+  assert_overlay_chain
+  [[ -z "$(attached_vm_for_path "$OVERLAY")" ]] ||
+    die "$vm Bitcoin overlay is already attached"
+  prepare_missing_index_overlays "$vm"
+  local serial id
+  serial="$(meta_get "$OVERLAY_META" disk_serial)"; id="$(overlay_id)"
+  if ! virshq attach-disk "$(domain "$vm")" "$OVERLAY" vdc --config \
+      --driver qemu --subdriver qcow2 --targetbus virtio --serial "$serial"; then
+    die "$vm retained Bitcoin overlay attachment failed"
+  fi
+  if ! attach_retained_indexes "$vm"; then
+    rollback_index_attachments "$vm"
+    detach_image "$vm" "$OVERLAY" || true
+    die "$vm retained index attachment failed; attachments were rolled back"
+  fi
+  if ! write_owner_record overlay "$vm" "$OVERLAY" "$id" "$serial"; then
+    rollback_index_attachments "$vm"
+    detach_image "$vm" "$OVERLAY" || true
+    die "$vm retained owner write failed; attachments were rolled back"
+  fi
+  meta_set "$OVERLAY_META" owner_state active
+  meta_set "$OVERLAY_META" attachment_state attached
+  if ! virshq start "$(domain "$vm")"; then
+    if is_shut_off "$vm"; then
+      rollback_index_attachments "$vm"
+      detach_image "$vm" "$OVERLAY" || true
+      rm -f -- "$OWNER_FILE"
+      meta_set "$OVERLAY_META" owner_state retained
+      meta_set "$OVERLAY_META" attachment_state detached
+    fi
+    die "$vm failed to resume; retained images were preserved"
+  fi
+  note "$vm resumed with its retained Bitcoin and index overlays"
 }
 
 guest_application_stop() {
   local vm="$1" script
   case "$vm" in
-    ubuntu) script=/usr/local/libexec/bvml/ubuntu-knots-rdts.sh ;;
+    ubuntu)
+      guest_exec_sync ubuntu /bin/bash "$GUEST_EXEC_TIMEOUT" -c '
+        set -Eeuo pipefail
+        index=/usr/local/libexec/bvml/ubuntu-indexers.sh
+        if [[ -x "$index" ]]; then
+          "$index" stop electrs
+          "$index" stop fulcrum
+        fi
+        knots=/usr/local/libexec/bvml/ubuntu-knots-rdts.sh
+        if [[ -x "$knots" ]]; then exec "$knots" stop; fi
+        echo "application already stopped: Knots lifecycle script is absent"
+      '
+      return
+      ;;
     umbrel) script="$(jq -r .os.data_directory "$UMBREL_PROFILE")/.bvml/bin/umbrel-adapter.sh" ;;
-    startos) script=/usr/local/libexec/bvml/startos-adapter.sh ;;
+    startos) script="$(jq -r .os.management_root "$STARTOS_PROFILE")/bin/startos-adapter.sh" ;;
   esac
+  if [[ "$vm" == umbrel ]]; then
+    local guest_bvml index_script
+    guest_bvml="$(jq -r .os.data_directory "$UMBREL_PROFILE")/.bvml"
+    index_script="$guest_bvml/bin/umbrel-indexers.sh"
+    umbrel_exec_sync /bin/bash "$GUEST_EXEC_TIMEOUT" -c '
+      set -Eeuo pipefail
+      index="$1"; bitcoin="$2"
+      if [[ -x "$index" ]]; then "$index" stop; fi
+      if [[ -x "$bitcoin" ]]; then exec "$bitcoin" stop; fi
+      echo "applications already stopped: adapters are absent"
+    ' bash "$index_script" "$script"
+    return
+  fi
+  if [[ "$vm" == startos ]]; then
+    local startos_root
+    startos_root="$(jq -r .os.management_root "$STARTOS_PROFILE")"
+    startos_exec_sync /bin/bash "$GUEST_EXEC_TIMEOUT" -c '
+        set -Eeuo pipefail
+        script="$1"; fulcrum="$2"; electrs="$3"
+        # Stop index packages before bitcoind so volume unmounts stay clean.
+        if [[ -x "$fulcrum" ]]; then "$fulcrum" stop; fi
+        if [[ -x "$electrs" ]]; then "$electrs" stop; fi
+        if [[ -x "$script" ]]; then
+          exec "$script" stop
+        fi
+        status="$(start-cli package list --format json |
+          jq -er ".[] | select(.id==\"bitcoind\") | .status")"
+        case "$status" in
+          installed|stopped) ;;
+          *) start-cli package stop bitcoind ;;
+        esac
+        for _ in $(seq 1 180); do
+          status="$(start-cli package list --format json |
+            jq -er ".[] | select(.id==\"bitcoind\") | .status")"
+          case "$status" in installed|stopped) break;; esac
+          sleep 2
+        done
+        case "$status" in installed|stopped) ;; *) exit 1;; esac
+        ! mountpoint -q /media/bvml-startos-overlay
+        dev="$(readlink -f /dev/disk/by-id/virtio-BVMLO-* 2>/dev/null || true)"
+        [[ -z "$dev" ]] || ! findmnt -rn -S "$dev" | grep -q .
+        sync
+      ' bash "$script" "$startos_root/bin/startos-fulcrum.sh" \
+        "$startos_root/bin/startos-electrs.sh"
+    return
+  fi
   platform_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" stop
 }
 
+stage_guest_index_identity() {
+  local vm="$1" json encoded path
+  json="$(index_active_json "$vm")"
+  [[ "$(jq '.services|length' <<<"$json")" != 0 ]] || return 0
+  encoded="$(base64 -w0 <<<"$json")"
+  case "$vm" in
+    ubuntu)
+      path=/etc/bvml/active-indexes.json
+      guest_exec_sync ubuntu /bin/bash 60 -c \
+        "printf %s '$encoded' | base64 -d >'$path'; chown root:root '$path'; chmod 0600 '$path'"
+      ;;
+    umbrel)
+      path="$(jq -r .os.data_directory "$UMBREL_PROFILE")/.bvml/etc/active-indexes.json"
+      umbrel_exec_sync /bin/bash 60 -c \
+        "printf %s '$encoded' | base64 -d >'$path'; chown root:root '$path'; chmod 0600 '$path'"
+      ;;
+    startos)
+      path="$(jq -r .os.management_root "$STARTOS_PROFILE")/active-indexes.json"
+      startos_exec_sync /bin/bash 60 -c \
+        "printf %s '$encoded' | base64 -d >'$path'; chown root:root '$path'; chmod 0600 '$path'"
+      ;;
+  esac
+}
+
+index_adapter_guest_action() {
+  local vm="$1" action="$2" service present=0 script evidence timeout="$GUEST_EXEC_TIMEOUT"
+  local -a services=()
+  while read -r service; do
+    if [[ -f "$(index_overlay "$vm" "$service")" && -f "$(index_overlay_meta "$vm" "$service")" ]]; then
+      services+=("$service")
+      present=1
+    fi
+  done < <(index_services_for_vm "$vm")
+  ((present)) || return 0
+  stage_guest_index_identity "$vm"
+  case "$vm" in
+    ubuntu)
+      script=/usr/local/libexec/bvml/ubuntu-indexers.sh
+      for service in "${services[@]}"; do
+        if [[ "$action" == setup ]]; then
+          guest_exec_sync ubuntu "$script" "$INDEX_BUILD_TIMEOUT" start "$service"
+        fi
+        guest_exec_sync ubuntu "$script" "$INDEX_BUILD_TIMEOUT" verify "$service"
+      done
+      return
+      ;;
+    umbrel)
+      script="$(jq -r .os.data_directory "$UMBREL_PROFILE")/.bvml/bin/umbrel-indexers.sh"
+      evidence="$(jq -r .os.data_directory "$UMBREL_PROFILE")/.bvml/etc/indexers-verification.json"
+      timeout="$INDEX_BUILD_TIMEOUT"
+      ;;
+    startos)
+      # StartOS runs one native package adapter per index service.
+      timeout="$INDEX_BUILD_TIMEOUT"
+      local startos_root part_file tmp
+      startos_root="$(jq -r .os.management_root "$STARTOS_PROFILE")"
+      tmp="$ADAPTER_STATE_DIR/$vm-indexers.json.new"
+      jq -n --arg platform startos --arg profile "${INDEX_PROFILE_SHA256,,}" \
+        '{platform:$platform,profile_digest:$profile,last_validation_result:"ok",
+          validated_at:(now|todateiso8601),services:{}}' >"$tmp"
+      for service in "${services[@]}"; do
+        script="$startos_root/bin/startos-${service}.sh"
+        evidence="$startos_root/${service}-verification.json"
+        platform_exec_sync "$vm" "$script" "$timeout" "$action"
+        platform_exec_sync "$vm" /bin/cat 30 "$evidence"
+        part_file="$ADAPTER_STATE_DIR/$vm-indexers-$service.json.new"
+        printf '%s\n' "$GUEST_EXEC_STDOUT" >"$part_file"
+        jq -e '
+          .last_validation_result=="ok" and .synchronized==true and
+          (.height|type=="number" and .>0) and
+          (.reused_existing_database==true)
+        ' "$part_file" >/dev/null ||
+          { rm -f "$part_file" "$tmp"; die "$vm $service index adapter returned invalid evidence"; }
+        jq --arg service "$service" --slurpfile part "$part_file" \
+          '.services[$service]=$part[0]' "$tmp" >"$tmp.next"
+        mv "$tmp.next" "$tmp"
+        rm -f "$part_file"
+      done
+      jq -e --arg platform "$vm" '
+        .platform==$platform and .last_validation_result=="ok" and
+        (.profile_digest|type=="string" and length>0) and
+        (.services|length>0)
+      ' "$tmp" >/dev/null || { rm -f "$tmp"; die "$vm returned invalid index adapter evidence"; }
+      chmod 0600 "$tmp"; mv "$tmp" "$ADAPTER_STATE_DIR/$vm-indexers.json"
+      return
+      ;;
+  esac
+  platform_exec_sync "$vm" "$script" "$timeout" "$action"
+  platform_exec_sync "$vm" /bin/cat 30 "$evidence"
+  local tmp="$ADAPTER_STATE_DIR/$vm-indexers.json.new"
+  printf '%s\n' "$GUEST_EXEC_STDOUT" >"$tmp"
+  jq -e --arg platform "$vm" '
+    .platform==$platform and .last_validation_result=="ok" and
+    (.profile_digest|type=="string" and length>0)
+  ' "$tmp" >/dev/null || { rm -f "$tmp"; die "$vm returned invalid index adapter evidence"; }
+  chmod 0600 "$tmp"; mv "$tmp" "$ADAPTER_STATE_DIR/$vm-indexers.json"
+}
+
 stop_vm() {
-  local vm="$1" waited=0; valid_vm "$vm"; is_defined "$vm" || die "VM is not defined: $vm"
-  assert_consistent_owner
+  local vm="$1" waited=0; valid_vm "$vm"; set_lifecycle_context "$vm"
+  is_defined "$vm" || die "VM is not defined: $vm"
   [[ "$(owner_vm)" == "$vm" && "$(overlay_vm)" == "$vm" ]] || die "$vm does not own the active overlay"
   if ! is_shut_off "$vm"; then
     if ! (guest_application_stop "$vm"); then
       write_env_file "$ADAPTER_RECOVERY_META" "operation=application-stop" "vm=$vm" \
         "image=$OVERLAY" "result=recovery-required" "recorded=$(date -u +%FT%TZ)"
+      meta_set "$OVERLAY_META" recovery_required 1
+      meta_set "$OVERLAY_META" adapter_state stop-failed
       die "$vm application stop failed; VM, mount, attachment, owner, and overlay were preserved"
     fi
     virshq shutdown "$(domain "$vm")"
@@ -179,29 +397,39 @@ stop_vm() {
   detach_image "$vm" "$OVERLAY"
   [[ -z "$(attached_vm_for_path "$OVERLAY")" ]] || die "overlay still attached; ownership retained"
   assert_no_process_reference "$OVERLAY"
+  detach_retained_indexes "$vm"
   rm -f -- "$OWNER_FILE"
-  [[ "$vm" != umbrel ]] || rm -f -- "$ADAPTER_RECOVERY_META"
+  meta_set "$OVERLAY_META" owner_state retained
+  meta_set "$OVERLAY_META" attachment_state detached
+  meta_set "$OVERLAY_META" mount_state unmounted
+  meta_set "$OVERLAY_META" adapter_state stopped
+  meta_set "$OVERLAY_META" recovery_required 0
+  rm -f -- "$ADAPTER_RECOVERY_META"
   note "$vm is shut off and detached; its overlay is retained for discard or promotion"
 }
 
 discard_overlay() {
-  local requested="${1:-}" vm
-  all_shut_off; assert_consistent_owner; assert_no_bitcoin_attachments; assert_no_extra_overlays
+  local requested="${1:?VM required}" vm="$1"
+  valid_vm "$vm"; set_lifecycle_context "$vm"
+  is_shut_off "$vm" || die "$(domain "$vm") is $(domain_state "$vm"); exact 'shut off' required"
+  assert_no_extra_overlays
   [[ ! -e "$OWNER_FILE" ]] || die "owner record remains; run stop for the owning VM"
   if [[ ! -e "$OVERLAY" && ! -e "$OVERLAY_META" ]]; then note "no active overlay"; return; fi
-  vm="$(overlay_vm)"; [[ -z "$requested" || "$requested" == "$vm" ]] ||
-    die "retained overlay belongs to $vm, not $requested"
+  [[ "$(overlay_vm)" == "$requested" ]] || die "retained overlay does not belong to $requested"
+  [[ -z "$(attached_vm_for_path "$OVERLAY")" ]] || die "$vm overlay remains attached"
   assert_no_process_reference "$OVERLAY"
   rm -f -- "$OVERLAY" "$OVERLAY_META" "$VERIFY_META" "$BOOTSTRAP_VERIFY"
+  discard_index_overlays "$vm"
   note "discarded $vm overlay; persistent VM disks and canonical checkpoint are unchanged"
 }
 
 reconcile_owner() {
-  local attached owner kind image meta manifest_vm manifest_id owner_id manifest_serial owner_serial
-  if [[ -f "$ADAPTER_RECOVERY_META" ]] && ! is_shut_off umbrel; then
-    die "Umbrel recovery is active while the VM is $(domain_state umbrel); inspect umbreld app state, container process, datadir mount, attachment, and owner before clean stop"
+  local vm="${1:?VM required}" attached owner kind image meta manifest_vm manifest_id owner_id manifest_serial owner_serial
+  valid_vm "$vm"; set_lifecycle_context "$vm"
+  if [[ -f "$ADAPTER_RECOVERY_META" ]] && ! is_shut_off "$vm"; then
+    die "$vm recovery is active while the VM is $(domain_state "$vm"); inspect application, mount, attachment, and owner state before clean stop"
   fi
-  all_shut_off
+  is_shut_off "$vm" || die "$(domain "$vm") must be exactly shut off for reconciliation"
   owner="$(owner_vm)"
   if [[ -n "$owner" ]]; then
     kind="$(owner_kind)"; image="$(owner_image)"; owner_id="$(meta_get "$OWNER_FILE" identity)"
@@ -221,10 +449,14 @@ reconcile_owner() {
     [[ -f "$image" && -f "$meta" && "$manifest_vm" == "$owner" && "$manifest_id" == "$owner_id" &&
        -n "$owner_serial" && "$manifest_serial" == "$owner_serial" ]] ||
       die "owner cannot be reconciled automatically: $kind image/manifest disagrees"
-    [[ "$(bitcoin_attachment_count)" == 0 ]] || die "conflicting Bitcoin storage attachment exists"
+    [[ -z "$(attached_vm_for_path "$image")" ]] || die "conflicting $vm Bitcoin storage attachment exists"
     [[ ! -f "$OVERLAY" || ! -f "$BOOTSTRAP" ]] || die "bootstrap and ordinary overlay coexist"
     rm -f -- "$OWNER_FILE"
-    [[ "$owner" != umbrel ]] || rm -f -- "$ADAPTER_RECOVERY_META"
+    [[ "$kind" != overlay ]] || {
+      meta_set "$meta" owner_state retained
+      meta_set "$meta" attachment_state detached
+    }
+    rm -f -- "$ADAPTER_RECOVERY_META"
     note "cleared stale detached $kind owner for retained $owner image"
   else note "owner state is already reconciled"; fi
 }
@@ -436,6 +668,7 @@ bootstrap_cleanup() {
 
 reset_vm() {
   local vm="$1"; valid_vm "$vm"
+  set_lifecycle_context "$vm"
   if [[ -f "$OVERLAY_META" && "$(overlay_vm)" != "$vm" ]]; then
     die "active overlay belongs to $(overlay_vm), not $vm"
   fi
@@ -599,10 +832,13 @@ verify_promotion_evidence() {
 
 checkpoint_verify() {
   need virt-cat; need virt-filesystems
+  set_lifecycle_context ubuntu
   [[ "$(overlay_vm)" == ubuntu ]] || die "verification is only valid for an Ubuntu overlay"
   [[ ! -e "$OWNER_FILE" ]] || die "stop Ubuntu before extracting verification"
-  all_shut_off; assert_no_bitcoin_attachments; assert_overlay_chain
-  local candidate="$ACTIVE_DIR/ubuntu-verification.new"
+  is_shut_off ubuntu || die "Ubuntu must be exactly shut off before verification"
+  [[ -z "$(attached_vm_for_path "$OVERLAY")" ]] || die "Ubuntu overlay remains attached"
+  assert_overlay_chain
+  local candidate="$(lifecycle_dir ubuntu)/verification.new"
   rm -f -- "$candidate"
   virt-cat -a "$OVERLAY" -m /dev/sda /.bvml/ubuntu-verification.env >"$candidate" ||
     { rm -f -- "$candidate"; die "guest verification file missing; run ubuntu-knots-rdts.sh verify-shutdown"; }
@@ -615,12 +851,74 @@ checkpoint_verify() {
   note "Ubuntu Knots/RDTS shutdown verification imported"
 }
 
+checkpoint_sync_start() {
+  [[ $# == 0 ]] || die "usage: bvml checkpoint-sync-start"
+  set_lifecycle_context ubuntu
+  [[ "$(owner_vm)" == ubuntu && "$(domain_state ubuntu)" == running ]] ||
+    die "Ubuntu must actively own and run its disposable checkpoint overlay"
+  assert_overlay_chain
+  guest_exec_sync ubuntu /usr/local/libexec/bvml/ubuntu-knots-rdts.sh 1200 install
+  guest_exec_sync ubuntu /usr/local/libexec/bvml/ubuntu-knots-rdts.sh 120 start
+  meta_set "$OVERLAY_META" adapter_state syncing
+  rm -f -- "$VERIFY_META"
+  note "Ubuntu Knots is synchronizing the chain and configured checkpoint indexes"
+}
+
+checkpoint_profile_migrate_guest() {
+  [[ $# == 0 ]] || die "usage: bvml checkpoint-profile-migrate-guest"
+  set_lifecycle_context ubuntu
+  [[ "$(owner_vm)" == ubuntu && "$(domain_state ubuntu)" == running ]] ||
+    die "Ubuntu must actively own and run its update overlay"
+  validate_checkpoint_profile
+  [[ "$(checkpoint_profile_id)" == mainnet-basic-filter-txindex-v1 ||
+     "$(checkpoint_profile_id)" == mainnet-basic-filter-v1 ]] ||
+    die "active host profile is not a supported basic-filter migration target"
+  local profile64
+  profile64="$(base64 -w0 "$CHECKPOINT_PROFILE_FILE")"
+  guest_exec_sync ubuntu /bin/bash 120 -c "
+    set -Eeuo pipefail
+    conf=/etc/bvml/knots.env
+    test -f \"\$conf\"
+    tmp_profile=\$(mktemp /etc/bvml/checkpoint-profile.json.XXXXXX)
+    tmp_conf=\$(mktemp /etc/bvml/knots.env.XXXXXX)
+    trap 'rm -f -- \"\$tmp_profile\" \"\$tmp_conf\"' EXIT
+    printf %s '$profile64' | base64 -d >\"\$tmp_profile\"
+    test \"\$(sha256sum \"\$tmp_profile\" | cut -d' ' -f1)\" = '${CHECKPOINT_PROFILE_SHA256,,}'
+    grep -Ev '^(CHECKPOINT_PROFILE_FILE|CHECKPOINT_PROFILE_SHA256|PROFILE_GENERATION_ID|PROFILE_GENERATION_DIGEST)=' \"\$conf\" >\"\$tmp_conf\"
+    printf '%s\n' \
+      'CHECKPOINT_PROFILE_FILE=/etc/bvml/checkpoint-profile.json' \
+      'CHECKPOINT_PROFILE_SHA256=${CHECKPOINT_PROFILE_SHA256,,}' \
+      'PROFILE_GENERATION_ID=$(profile_generation_id)' \
+      'PROFILE_GENERATION_DIGEST=$(active_profile_generation_digest)' >>\"\$tmp_conf\"
+    chown root:root \"\$tmp_profile\" \"\$tmp_conf\"
+    chmod 0644 \"\$tmp_profile\" \"\$tmp_conf\"
+    mv -f -- \"\$tmp_profile\" /etc/bvml/checkpoint-profile.json
+    mv -f -- \"\$tmp_conf\" \"\$conf\"
+    trap - EXIT
+  "
+  meta_set "$OVERLAY_META" profile_migration_target "$(checkpoint_profile_id)"
+  meta_set "$OVERLAY_META" profile_migration_sha256 "${CHECKPOINT_PROFILE_SHA256,,}"
+  note "installed the active checkpoint migration profile in Ubuntu"
+}
+
+checkpoint_sync_finish() {
+  [[ $# == 0 ]] || die "usage: bvml checkpoint-sync-finish"
+  set_lifecycle_context ubuntu
+  [[ "$(owner_vm)" == ubuntu && "$(domain_state ubuntu)" == running ]] ||
+    die "Ubuntu must actively own and run its update overlay"
+  guest_exec_sync ubuntu /usr/local/libexec/bvml/ubuntu-knots-rdts.sh 14400 verify-shutdown
+  stop_vm ubuntu
+  note "Ubuntu checkpoint update is verified, shut off, detached, and retained"
+}
+
 checkpoint_promote() {
   [[ "${1:-}" == "--confirm-synced-clean" && $# == 1 ]] ||
     die "promotion requires --confirm-synced-clean after guest verification"
   need qemu-img; need virt-ls; need virt-cat; need virt-customize; require_canonical
+  set_lifecycle_context ubuntu
   [[ "$(overlay_vm)" == ubuntu ]] || die "only an Ubuntu overlay may be promoted"
   [[ ! -e "$OWNER_FILE" ]] || die "runtime owner remains; stop Ubuntu first"
+  assert_only_dependent_overlay ubuntu
   all_shut_off; assert_consistent_owner; assert_no_bitcoin_attachments; assert_no_extra_overlays
   assert_no_process_reference "$OVERLAY"; assert_no_process_reference "$CANONICAL"
   assert_overlay_chain; verify_promotion_evidence "$VERIFY_META" overlay
@@ -679,11 +977,109 @@ checkpoint_promote() {
   note "checkpoint promoted; previous canonical preserved as rollback"
 }
 
+checkpoint_commit_no_rollback() {
+  [[ "${1:-}" == --confirm-no-rollback && $# == 1 ]] ||
+    die "usage: bvml checkpoint-commit --confirm-no-rollback"
+  [[ "$ROLLBACK_RETENTION" == none ]] ||
+    die "checkpoint-commit is only for the explicit no-rollback storage policy"
+  need qemu-img; need guestfish
+  local resume_after_commit=0
+  if [[ -f "$RECOVERY_META" &&
+        "$(meta_get "$RECOVERY_META" operation)" == checkpoint-commit-no-rollback ]]; then
+    case "$(meta_get "$RECOVERY_META" state)" in
+      transient-cleanup-failed|post-commit-qemu-check-failed|post-commit-datadir-validation-failed)
+        resume_after_commit=1
+        ;;
+    esac
+  fi
+  set_lifecycle_context ubuntu
+  [[ "$(overlay_vm)" == ubuntu && ! -e "$OWNER_FILE" ]] ||
+    die "a stopped retained Ubuntu update overlay is required"
+  assert_only_dependent_overlay ubuntu
+  all_shut_off
+  (( resume_after_commit )) || assert_consistent_owner
+  assert_no_bitcoin_attachments
+  assert_no_extra_overlays
+  assert_no_process_reference "$OVERLAY"
+  assert_no_process_reference "$CANONICAL"
+  assert_overlay_chain
+  verify_promotion_evidence "$VERIFY_META" overlay
+  [[ "$(meta_get "$VERIFY_META" checkpoint_profile_id)" == mainnet-basic-filter-txindex-v1 ||
+     "$(meta_get "$VERIFY_META" checkpoint_profile_id)" == mainnet-basic-filter-v1 ]] ||
+    die "no-rollback commit requires a basic-filter checkpoint profile"
+  qemu-img check -r leaks "$OVERLAY"
+  qemu-img check "$CANONICAL"
+  [[ "$(meta_get "$OVERLAY_META" canonical_id)" == "$(canonical_id)" &&
+     "$(meta_get "$OVERLAY_META" checkpoint_generation)" == "$(checkpoint_generation)" ]] ||
+    die "Ubuntu overlay no longer belongs to the installed canonical"
+  local old_id old_generation new_id new_generation
+  old_id="$(canonical_id)"; old_generation="$(checkpoint_generation)"
+  new_generation="$(new_id)"
+  if (( resume_after_commit )); then
+    [[ "$(meta_get "$RECOVERY_META" overlay)" == "$OVERLAY" &&
+       "$(meta_get "$RECOVERY_META" old_canonical_id)" == "$old_id" &&
+       "$(meta_get "$RECOVERY_META" old_checkpoint_generation)" == "$old_generation" ]] ||
+      die "interrupted commit recovery metadata does not match the retained lifecycle"
+    local overlay_actual_size
+    overlay_actual_size="$(qemu-img info --output=json "$OVERLAY" | jq -r '."actual-size"')"
+    (( overlay_actual_size <= 16777216 )) ||
+      die "interrupted commit overlay is not empty enough to resume safely"
+    note "resuming the verified post-commit cleanup and canonical finalization"
+  else
+    write_env_file "$RECOVERY_META" "operation=checkpoint-commit-no-rollback" \
+      "state=committing" "old_canonical_id=$old_id" \
+      "old_checkpoint_generation=$old_generation" "overlay=$OVERLAY" \
+      "started=$(date -u +%FT%TZ)"
+    unprotect_image "$CANONICAL"
+    if ! qemu-img commit -p "$OVERLAY"; then
+      protect_image "$CANONICAL" || true
+      meta_set "$RECOVERY_META" state commit-failed-canonical-needs-validation
+      die "in-place commit failed; overlay was preserved and canonical requires recovery validation"
+    fi
+    sync -f "$CANONICAL_DIR"
+  fi
+  unprotect_image "$CANONICAL"
+  guestfish_data_disk "$CANONICAL" rm-f /.bvml/ubuntu-verification.env >/dev/null ||
+    { protect_image "$CANONICAL" || true
+      meta_set "$RECOVERY_META" state transient-cleanup-failed
+      die "commit completed but transient evidence cleanup failed; overlay preserved"; }
+  qemu-img check "$CANONICAL" >/dev/null ||
+    { protect_image "$CANONICAL" || true
+      meta_set "$RECOVERY_META" state post-commit-qemu-check-failed
+      die "committed canonical failed qemu-img check; overlay preserved"; }
+  validate_checkpoint_image "$CANONICAL" ||
+    { protect_image "$CANONICAL" || true
+      meta_set "$RECOVERY_META" state post-commit-datadir-validation-failed
+      die "committed canonical failed datadir validation; overlay preserved"; }
+  new_id="$(sha256sum "$CANONICAL" | awk '{print $1}')"
+  write_env_file "$CANONICAL_META" \
+    "id=$new_id" "generation=$new_generation" "created=$(date -u +%FT%TZ)" \
+    "network=main" "blocksxor=0" "layout=root-datadir" \
+    "kind=knots-rdts-in-place-commit" \
+    "knots_version_normalized=$(meta_get "$VERIFY_META" knots_version_normalized)" \
+    "checkpoint_profile_id=$(checkpoint_profile_id)" \
+    "checkpoint_profile_sha256=${CHECKPOINT_PROFILE_SHA256,,}" \
+    "profile_generation_id=$(profile_generation_id)" \
+    "profile_generation_digest=$(active_profile_generation_digest)" \
+    "release_profile_sha256=${KNOTS_RELEASE_PROFILE_SHA256,,}" \
+    "rdts_profile_sha256=${KNOTS_RDTS_PROFILE_SHA256,,}" \
+    "filesystem_uuid=$(meta_get "$VERIFY_META" filesystem_uuid)" \
+    "block_height=$(meta_get "$VERIFY_META" block_height)" \
+    "best_block_hash=$(meta_get "$VERIFY_META" best_block_hash)" \
+    "best_block_time=$(meta_get "$VERIFY_META" best_block_time)" \
+    "index_state_json=$(meta_get "$VERIFY_META" index_state_json)"
+  protect_image "$CANONICAL"
+  canonical_preflight
+  rm -f -- "$OVERLAY" "$OVERLAY_META" "$VERIFY_META" "$RECOVERY_META"
+  sync -f "$CANONICAL_DIR"
+  note "committed Ubuntu update in place with no rollback; disaster recovery remains re-IBD"
+}
+
 checkpoint_rollback() {
+  assert_no_dependent_overlays
   require_canonical; [[ -f "$ROLLBACK" && -f "$ROLLBACK_META" ]] || die "rollback checkpoint is missing"
   all_shut_off; assert_no_bitcoin_attachments
   assert_no_process_reference "$CANONICAL"; assert_no_process_reference "$ROLLBACK"
-  [[ ! -e "$OVERLAY" && ! -e "$OWNER_FILE" ]] || die "discard the active overlay before rollback"
   validate_checkpoint_image "$ROLLBACK" || die "rollback candidate failed independent validation; canonical unchanged"
   local swap="$CANONICAL_DIR/rollback-swap.qcow2" swapmeta="$CANONICAL_DIR/rollback-swap.env"
   if [[ -n "$ROLLBACK_DESTINATION" ]]; then
@@ -730,6 +1126,7 @@ checkpoint_rollback() {
 
 rollback_remove() {
   [[ "${1:-}" == "--confirm-remove" && $# == 1 ]] || die "rollback-remove requires --confirm-remove"
+  assert_no_dependent_overlays
   all_shut_off; assert_no_bitcoin_attachments
   [[ -f "$ROLLBACK" ]] || die "no rollback checkpoint exists"
   assert_no_process_reference "$ROLLBACK"
@@ -743,6 +1140,7 @@ recovery_ack() {
   [[ "${1:-}" == --confirm-reviewed && $# == 1 ]] ||
     die "recovery-ack requires --confirm-reviewed after inspecting status and recovery metadata"
   [[ -f "$RECOVERY_META" ]] || die "no recovery metadata exists"
+  assert_no_dependent_overlays
   all_shut_off; assert_no_bitcoin_attachments
   [[ ! -f "$CANONICAL" ]] || canonical_preflight
   local operation result
@@ -764,6 +1162,13 @@ recovery_ack() {
   esac
   rm -f -- "$RECOVERY_META"
   note "reviewed recovery metadata cleared; valuable canonical/bootstrap/overlay state was preserved"
+}
+
+checkpoint_protect() {
+  assert_no_dependent_overlays
+  all_shut_off
+  assert_no_bitcoin_attachments
+  protect_image "$CANONICAL"
 }
 
 adapter_status() {
@@ -788,7 +1193,12 @@ adapter_guest_action() {
   [[ "$(owner_vm)" == "$vm" && ! "$(is_shut_off "$vm" && echo yes)" == yes ]] ||
     die "$vm must actively own the overlay"
   local script="/usr/local/libexec/bvml/${vm}-adapter.sh" evidence=/etc/bvml/adapter-verification.json
+  # Bitcoin adapter setup waits for tip catch-up; use the platform operation
+  # timeout (not the short guest-exec default) so the host does not kill SSH
+  # while the guest is still legitimately waiting on IBD/indexes.
+  local action_timeout="$GUEST_EXEC_TIMEOUT"
   if [[ "$vm" == umbrel ]]; then
+    action_timeout="$UMBREL_OPERATION_TIMEOUT"
     local active_json active64 guest_bvml
     guest_bvml="$(jq -r .os.data_directory "$UMBREL_PROFILE")/.bvml"
     script="$guest_bvml/bin/umbrel-adapter.sh"
@@ -808,16 +1218,48 @@ adapter_guest_action() {
     active64="$(base64 -w0 <<<"$active_json")"
     umbrel_exec_sync /bin/bash 60 -c \
 	      "printf %s '$active64' | base64 -d > '$guest_bvml/etc/active-overlay.json'; chown root:root '$guest_bvml/etc/active-overlay.json'; chmod 0600 '$guest_bvml/etc/active-overlay.json'"
+  elif [[ "$vm" == startos ]]; then
+    action_timeout="$STARTOS_OPERATION_TIMEOUT"
+    local active_json active64 startos_guest_root
+    startos_guest_root="$(jq -r .os.management_root "$STARTOS_PROFILE")"
+    script="$startos_guest_root/bin/startos-adapter.sh"
+    evidence="$startos_guest_root/adapter-verification.json"
+    active_json="$(jq -n --arg lifecycle "$(overlay_id)" \
+      --arg overlay "$(overlay_id)" --arg canonical "$(canonical_id)" \
+      --arg generation "$(checkpoint_generation)" \
+      --arg serial "$(meta_get "$OVERLAY_META" disk_serial)" \
+      --arg uuid "$(meta_get "$STARTOS_LAYER_META" filesystem_uuid)" \
+      --arg startos_profile "${STARTOS_PROFILE_SHA256,,}" \
+      --argjson size "$(meta_get "$OVERLAY_META" size_bytes)" \
+      '{lifecycle_id:$lifecycle,overlay_id:$overlay,canonical_id:$canonical,
+        checkpoint_generation:$generation,disk_serial:$serial,
+        filesystem_uuid:$uuid,size_bytes:$size,
+        startos_profile_sha256:$startos_profile}')"
+    active64="$(base64 -w0 <<<"$active_json")"
+    startos_exec_sync /bin/bash 60 -c \
+      "mountpoint -q /media/startos/data/main; install -d -o root -g root -m 0700 '$startos_guest_root'; printf %s '$active64' | base64 -d > '$startos_guest_root/active-overlay.json'; chown root:root '$startos_guest_root/active-overlay.json'; chmod 0600 '$startos_guest_root/active-overlay.json'"
   fi
-  if ! (platform_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" "$action"); then
+  stage_guest_index_identity "$vm"
+  if ! (platform_exec_sync "$vm" "$script" "$action_timeout" "$action"); then
     write_env_file "$ADAPTER_RECOVERY_META" "operation=adapter-$action" "vm=$vm" \
       "image=$OVERLAY" "result=recovery-required" "recorded=$(date -u +%FT%TZ)"
+    meta_set "$OVERLAY_META" recovery_required 1
+    meta_set "$OVERLAY_META" adapter_state failed
     die "$vm adapter $action failed; active state and diagnostics were preserved"
   fi
+  if ! (index_adapter_guest_action "$vm" "$action"); then
+    write_env_file "$ADAPTER_RECOVERY_META" "operation=index-adapter-$action" "vm=$vm" \
+      "image=$OVERLAY" "result=recovery-required" "recorded=$(date -u +%FT%TZ)"
+    meta_set "$OVERLAY_META" recovery_required 1
+    meta_set "$OVERLAY_META" adapter_state failed
+    die "$vm index adapter $action failed; all overlays and diagnostics were preserved"
+  fi
   if [[ "$action" != verify ]] &&
-     ! (platform_exec_sync "$vm" "$script" "$GUEST_EXEC_TIMEOUT" verify); then
+     ! (platform_exec_sync "$vm" "$script" "$action_timeout" verify); then
     write_env_file "$ADAPTER_RECOVERY_META" "operation=adapter-verify" "vm=$vm" \
       "image=$OVERLAY" "result=recovery-required" "recorded=$(date -u +%FT%TZ)"
+    meta_set "$OVERLAY_META" recovery_required 1
+    meta_set "$OVERLAY_META" adapter_state failed
     die "$vm post-setup verification failed; active state and diagnostics were preserved"
   fi
   platform_exec_sync "$vm" /bin/cat 30 "$evidence"
@@ -830,7 +1272,10 @@ adapter_guest_action() {
   ' "$tmp" >/dev/null || { rm -f -- "$tmp"; die "$vm returned invalid adapter verification metadata"; }
   chmod 0600 "$tmp"
   mv -- "$tmp" "$ADAPTER_STATE_DIR/$vm.json"
-  [[ "$vm" != umbrel ]] || rm -f -- "$ADAPTER_RECOVERY_META"
+  meta_set "$OVERLAY_META" mount_state mounted
+  meta_set "$OVERLAY_META" adapter_state validated
+  meta_set "$OVERLAY_META" recovery_required 0
+  rm -f -- "$ADAPTER_RECOVERY_META"
   note "$vm adapter $action completed and verified guest profile metadata was recorded"
 }
 
@@ -838,31 +1283,45 @@ validate_all() { exec "$ROOT/scripts/vm/validate.sh"; }
 status_all() { exec "$ROOT/scripts/vm/status.sh"; }
 
 case "$command" in
-  init) with_lock note "storage initialized at $BVML_STORAGE" ;;
-  create) with_lock "$ROOT/scripts/vm/create.sh" "${1:?VM required}" ;;
-  start) with_lock start_vm "${1:?VM required}" "${2:-}" ;;
-  stop) with_lock stop_vm "${1:?VM required}" ;;
-  discard) with_lock discard_overlay "${1:-}" ;;
-  reset) with_lock reset_vm "${1:?VM required}" ;;
-  reconcile) with_lock reconcile_owner ;;
-  checkpoint-bootstrap) with_lock checkpoint_bootstrap ;;
-  bootstrap-init) with_lock bootstrap_init "$@" ;;
-  bootstrap-stop) with_lock bootstrap_stop ;;
-  bootstrap-verify) with_lock bootstrap_verify ;;
-  bootstrap-promote) with_lock bootstrap_promote "$@" ;;
-  bootstrap-cleanup) with_lock bootstrap_cleanup ;;
+  init) with_global_lock note "storage initialized at $BVML_STORAGE" ;;
+  create) with_vm_lock "${1:?VM required}" "$ROOT/scripts/vm/create.sh" "$1" ;;
+  create-resume) with_vm_lock "${1:?VM required}" "$ROOT/scripts/vm/create-resume.sh" "$1" ;;
+  start) with_vm_lock "${1:?VM required}" start_vm "$@" ;;
+  resume) with_vm_lock "${1:?VM required}" resume_vm "$@" ;;
+  stop) with_vm_lock "${1:?VM required}" stop_vm "$1" ;;
+  discard) with_vm_lock "${1:?VM required}" discard_overlay "$1" ;;
+  reset) with_vm_lock "${1:?VM required}" reset_vm "$1" ;;
+  reconcile)
+    if (($#)); then
+      with_vm_lock "$1" reconcile_owner "$1"
+    else
+      for vm in ubuntu umbrel startos; do with_vm_lock "$vm" reconcile_owner "$vm"; done
+    fi
+    ;;
+  checkpoint-bootstrap) with_global_lock checkpoint_bootstrap ;;
+  bootstrap-init) with_global_lock bootstrap_init "$@" ;;
+  bootstrap-stop) with_global_lock bootstrap_stop ;;
+  bootstrap-verify) with_global_lock bootstrap_verify ;;
+  bootstrap-promote) with_global_lock bootstrap_promote "$@" ;;
+  bootstrap-cleanup) with_global_lock bootstrap_cleanup ;;
   bootstrap-status) status_all ;;
-  checkpoint-import) with_lock checkpoint_import "$@" ;;
-  checkpoint-verify) with_lock checkpoint_verify ;;
-  checkpoint-promote) with_lock checkpoint_promote "$@" ;;
-  checkpoint-protect) with_lock protect_image "$CANONICAL" ;;
-  checkpoint-rollback) with_lock checkpoint_rollback ;;
-  rollback-remove) with_lock rollback_remove "$@" ;;
-  recovery-ack) with_lock recovery_ack "$@" ;;
-  adapter-setup) with_lock adapter_guest_action "${1:?VM required}" setup ;;
-  adapter-validate) with_lock adapter_guest_action "${1:?VM required}" verify ;;
+  checkpoint-import) with_global_lock checkpoint_import "$@" ;;
+  checkpoint-sync-start) with_vm_lock ubuntu checkpoint_sync_start "$@" ;;
+  checkpoint-profile-migrate-guest) with_vm_lock ubuntu checkpoint_profile_migrate_guest "$@" ;;
+  checkpoint-sync-finish) with_vm_lock ubuntu checkpoint_sync_finish "$@" ;;
+  checkpoint-verify) with_vm_lock ubuntu checkpoint_verify ;;
+  checkpoint-promote) with_global_lock checkpoint_promote "$@" ;;
+  checkpoint-commit) with_global_lock checkpoint_commit_no_rollback "$@" ;;
+  checkpoint-protect) with_global_lock checkpoint_protect ;;
+  checkpoint-rollback) with_global_lock checkpoint_rollback ;;
+  rollback-remove) with_global_lock rollback_remove "$@" ;;
+  recovery-ack) with_global_lock recovery_ack "$@" ;;
+  adapter-setup) with_vm_lock "${1:?VM required}" adapter_guest_action "$1" setup ;;
+  adapter-validate) with_vm_lock "${1:?VM required}" adapter_guest_action "$1" verify ;;
+  index-adapter-setup) with_vm_lock "${1:?VM required}" index_adapter_guest_action "$1" setup ;;
+  index-adapter-validate) with_vm_lock "${1:?VM required}" index_adapter_guest_action "$1" verify ;;
   adapter-status) adapter_status "${1:-}" ;;
-  validate) with_lock validate_all ;;
+  validate) with_all_vm_locks validate_all ;;
   status) status_all ;;
   *) die "unknown command: $command" ;;
 esac

@@ -83,24 +83,46 @@ resolve_app() {
   APP_DIR="$UMBREL_ROOT/app-data/$APP_ID"
   EXPORTS="$APP_DIR/exports.sh"
   [[ -f "$EXPORTS" ]] || fail "installed exports.sh is missing"
-  local key expected actual repo
+  local key expected actual repo migrate_source_record=0
   repo="$(find "$UMBREL_ROOT/app-stores" -type f -path '*/.git/config' \
     -exec grep -lF 'github.com/getumbrel/umbrel-apps' {} \; 2>/dev/null |
     sed 's#/.git/config$##' | head -1)"
-  [[ -n "$repo" && "$(git -C "$repo" rev-parse HEAD)" == "$(jqv .app_store.commit)" ]] ||
-    fail "installed app is not bound to the pinned official app-store commit"
-  while IFS=$'\t' read -r key expected; do
-    actual="$(sha256sum "$repo/$APP_ID/$key" | awk '{print $1}')" ||
-      fail "missing pinned upstream package file $key"
-    [[ "$actual" == "$expected" ]] ||
-      fail "pinned upstream package file drift: $key"
-  done < <(jq -r '.app_store.files | to_entries[] | [.key,.value] | @tsv' "$PROFILE")
+  if [[ -f "$BVML_STATE/etc/umbrel-provisioned.json" ]]; then
+    jq -e --arg profile "$PROFILE_SHA" '.profile_digest==$profile' \
+      "$BVML_STATE/etc/umbrel-provisioned.json" >/dev/null ||
+      fail "installed app provisioning record belongs to another profile"
+    if jq -e --arg commit "$(jqv .app_store.commit)" '.source_commit==$commit' \
+      "$BVML_STATE/etc/umbrel-provisioned.json" >/dev/null; then
+      :
+    elif jq -e 'has("source_commit")|not' \
+      "$BVML_STATE/etc/umbrel-provisioned.json" >/dev/null; then
+      migrate_source_record=1
+    else
+      fail "installed app provisioning record is not bound to the pinned app-store commit"
+    fi
+  else
+    [[ -n "$repo" && "$(git -C "$repo" rev-parse HEAD)" == "$(jqv .app_store.commit)" ]] ||
+      fail "app installation source is not the pinned official app-store commit"
+    while IFS=$'\t' read -r key expected; do
+      actual="$(sha256sum "$repo/$APP_ID/$key" | awk '{print $1}')" ||
+        fail "missing pinned upstream package file $key"
+      [[ "$actual" == "$expected" ]] ||
+        fail "pinned upstream package file drift: $key"
+    done < <(jq -r '.app_store.files | to_entries[] | [.key,.value] | @tsv' "$PROFILE")
+  fi
   while IFS=$'\t' read -r key expected; do
     actual="$(sha256sum "$APP_DIR/$key" | awk '{print $1}')" ||
       fail "missing transformed installed package file $key"
     [[ "$actual" == "$expected" ]] ||
       fail "Umbrel legacy-compat package transformation drift: $key"
   done < <(jq -r '.app_store.installed_files | to_entries[] | [.key,.value] | @tsv' "$PROFILE")
+  if (( migrate_source_record )); then
+    local provisioned_tmp="$BVML_STATE/etc/umbrel-provisioned.json.new"
+    jq --arg commit "$(jqv .app_store.commit)" '.source_commit=$commit' \
+      "$BVML_STATE/etc/umbrel-provisioned.json" >"$provisioned_tmp"
+    chown root:root "$provisioned_tmp"; chmod 0600 "$provisioned_tmp"
+    mv -f -- "$provisioned_tmp" "$BVML_STATE/etc/umbrel-provisioned.json"
+  fi
   # exports.sh is trusted only after its pinned digest has been checked.
   EXPORTS_APP_DIR="$APP_DIR"; EXPORTS_APP_ID="$APP_ID"; EXPORTS_TOR_DATA_DIR="$UMBREL_ROOT/tor/data"
   export EXPORTS_APP_DIR EXPORTS_APP_ID EXPORTS_TOR_DATA_DIR UMBREL_ROOT
@@ -215,6 +237,63 @@ wait_knots_ready() {
   done
   [[ -z "${cid:-}" ]] || docker logs --tail 200 "$cid" >&2 || true
   fail "timed out waiting for the official Knots process and RPC to become ready"
+}
+
+wait_checkpoint_ready() {
+  local waited=0 cid chain indexes
+  while (( waited < TIMEOUT )); do
+    cid="$(container_id 2>/dev/null || true)"
+    if [[ -n "$cid" ]]; then
+      chain="$(docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
+        "-rpcport=$APP_BITCOIN_KNOTS_RPC_PORT" getblockchaininfo 2>/dev/null || true)"
+      indexes="$(docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
+        "-rpcport=$APP_BITCOIN_KNOTS_RPC_PORT" getindexinfo 2>/dev/null || true)"
+      if jq -e --argjson minimum "$(jq -r .expected_minimum_height "$ACTIVE")" '
+          .chain=="main" and .initialblockdownload==false and
+          .blocks==.headers and .blocks >= $minimum
+        ' <<<"$chain" >/dev/null 2>&1 &&
+        jq -e --argjson expected "$(jq '.knots.required_indexes' "$PROFILE")" \
+          --argjson height "$(jq -r .blocks <<<"$chain")" '
+          . as $actual |
+          all($expected[]; . as $name |
+            ($actual | has($name)) and $actual[$name].synced==true and
+            ($actual[$name].best_block_height // -1) >= $height)
+        ' <<<"$indexes" >/dev/null 2>&1; then
+        return 0
+      fi
+    fi
+    sleep 10
+    waited=$((waited + 10))
+  done
+  [[ -z "${cid:-}" ]] || docker logs --tail 300 "$cid" >&2 || true
+  fail "timed out waiting for Umbrel Knots chain and checkpoint indexes"
+}
+
+prepared() {
+  local cid pid exe digest args chain
+  load_profile; verify_os; resolve_app
+  mountpoint -q "$DATADIR" || fail "Knots datadir is not mounted"
+  cid="$(container_id)"
+  pid="$(actual_knots_pid "$cid")" || fail "actual Knots process not found"
+  exe="$(docker exec "$cid" readlink -f "/proc/$pid/exe")"
+  [[ "$exe" == "$KNOTS_EXE" ]] || fail "live Knots executable differs from profile"
+  digest="$(docker exec "$cid" sha256sum "$KNOTS_EXE" | awk '{print $1}')"
+  [[ "$digest" == "$KNOTS_SHA" ]] || fail "live Knots binary digest mismatch"
+  args="$(docker exec "$cid" sh -ceu 'tr "\0" "\n" <"/proc/$1/cmdline"' sh "$pid" |
+    jq -Rsc 'split("\n")[:-1]')"
+  jq -e --arg d "$CONTAINER_DATADIR" 'any(.[];.=="-datadir="+$d)' <<<"$args" >/dev/null ||
+    fail "live Knots process does not use the mounted datadir"
+  jq -e --argjson active "$(cat "$ACTIVE")" '
+    .overlay_id==$active.overlay_id and .canonical_id==$active.canonical_id and
+    .checkpoint_generation==$active.checkpoint_generation and
+    .filesystem_uuid==$active.filesystem_uuid
+  ' "$DATADIR/.bvml-overlay.json" >/dev/null || fail "overlay marker does not match host identity"
+  chain="$(docker exec "$cid" bitcoin-cli "-datadir=$CONTAINER_DATADIR" \
+    "-rpcport=$APP_BITCOIN_KNOTS_RPC_PORT" getblockchaininfo)"
+  jq -n --arg container "$cid" --arg pid "$pid" --arg digest "$digest" \
+    --argjson args "$args" --argjson chain "$chain" \
+    '{prepared:true,container_id:$container,knots_pid:$pid,
+      knots_binary_digest:$digest,observed_args:$args,blockchain:$chain}'
 }
 
 validate_device() {
@@ -419,15 +498,18 @@ setup() {
   mount_overlay
   umbrel_app_start
   wait_knots_ready
+  wait_checkpoint_ready
   verify_runtime
 }
 
 verify() {
   load_profile; verify_os; resolve_app
   mountpoint -q "$DATADIR" || fail "Knots datadir is not mounted"
+  wait_checkpoint_ready
   verify_runtime
   umbrel_app_restart
   wait_knots_ready
+  wait_checkpoint_ready
   verify_runtime
 }
 
@@ -474,17 +556,20 @@ install_app() {
     mv "$DATADIR" "$quarantine"
   fi
   install -d -o root -g root -m 0700 "$DATADIR"
-  jq -n --arg profile "$PROFILE_SHA" --arg root "$UMBREL_ROOT" --arg app "$APP_DIR" \
+  jq -n --arg profile "$PROFILE_SHA" --arg commit "$(jqv .app_store.commit)" \
+    --arg root "$UMBREL_ROOT" --arg app "$APP_DIR" \
     --arg datadir "$DATADIR" --arg now "$(date -u +%FT%TZ)" \
-    '{profile_digest:$profile,umbrel_root:$root,app_dir:$app,datadir:$datadir,
-      provisioned_at:$now}' >"$BVML_STATE/etc/umbrel-provisioned.json"
+    '{profile_digest:$profile,source_commit:$commit,umbrel_root:$root,
+      app_dir:$app,datadir:$datadir,provisioned_at:$now}' \
+    >"$BVML_STATE/etc/umbrel-provisioned.json"
 }
 
 case "${1:-status}" in
   install-app) install_app ;;
   setup) setup ;;
+  prepared) prepared ;;
   verify|status) verify ;;
-  restart) load_profile; verify_os; resolve_app; umbrel_app_restart; wait_knots_ready; verify_runtime ;;
+  restart) load_profile; verify_os; resolve_app; umbrel_app_restart; wait_knots_ready; wait_checkpoint_ready; verify_runtime ;;
   stop) stop ;;
   *) fail "usage: $0 {install-app|setup|verify|restart|stop|status}" ;;
 esac

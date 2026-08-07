@@ -106,7 +106,7 @@ Selected paths are measured first, absolute bytes plus configured headroom are
 passed to `virt-make-fs`, ownership/permissions are normalized, and the
 candidate is validated before canonical state changes.
 
-## Normal sequential testing
+## Normal consumer testing
 
 ```bash
 ./bin/bvml start umbrel
@@ -123,8 +123,9 @@ app, and `adapter-validate umbrel` must record live proof before the cycle is
 considered validated. StartOS retains the explicit `--adapter-setup` recovery
 mode until its package implementation is available.
 
-`start` requires every domain to be exactly `shut off`, no owner, no retained
-overlay, and a protected canonical. Its fast canonical preflight checks
+`start VM` requires that selected domain to be exactly `shut off`, with no
+owner or retained overlay for that VM, and a protected canonical. Other VM
+lifecycles may remain active. Its fast canonical preflight checks
 ID/generation/profile, qcow2 and standalone state, `qemu-img`, datadir layout,
 non-XOR metadata, mode, immutability, system-QEMU access, process references,
 and direct attachments. It creates a unique overlay ID, invalidates old
@@ -143,12 +144,90 @@ attachment and process reference are gone, clears active ownership, and retains
 the overlay. Every other libvirt state—including paused, blocked, in shutdown,
 pmsuspended, crashed, unknown, or unavailable—is unsafe.
 
-`discard` deletes only a detached disposable overlay and its current evidence.
-`reset VM` performs the complete stop when active and then discards. A retained
-overlay must be discarded or promoted before another VM starts. `reconcile`
-clears stale ordinary-overlay or bootstrap ownership only after all guests are
-exactly shut off, the owner-kind image is detached and unopened, its manifest
-identity agrees, and no conflicting Bitcoin state exists.
+`discard VM` deletes only that VM's detached disposable overlay and evidence.
+`reset VM` performs its complete stop when active and then discards it.
+Independent Ubuntu, Umbrel, and StartOS overlays may coexist and run
+concurrently. `reconcile [VM]` clears only provably stale ownership for the
+selected lifecycle after that VM is exactly shut off and its image is detached
+and unopened. Canonical mutations remain blocked while dependent consumer
+overlays exist.
+
+## Reusable Electrs and Fulcrum bases
+
+Electrum index databases are separate protected qcow2 bases bound to the
+current Bitcoin canonical ID and generation. Both bases use Btrfs so their
+disposable children can serve Ubuntu, Umbrel, and the native StartOS Fulcrum
+package without filesystem conversion. Ubuntu produces both bases; appliances
+are consumers only.
+
+With Ubuntu already holding a retained Bitcoin overlay and the guest stopped,
+create the incomplete bootstrap images, resume Ubuntu so libvirt attaches
+them, provision the pinned index integration, and explicitly initialize each
+identified disk:
+
+```bash
+# Ubuntu must be exactly shut off with a retained Bitcoin overlay.
+./bin/bvml index-bootstrap electrs
+./bin/bvml index-bootstrap fulcrum
+./bin/bvml resume ubuntu
+./bin/bvml guest-index-provision ubuntu
+./bin/bvml index-bootstrap-init electrs --confirm-index-format
+./bin/bvml index-bootstrap-init fulcrum --confirm-index-format
+./bin/bvml index-bootstrap-start electrs
+./bin/bvml index-bootstrap-start fulcrum
+./bin/bvml index-status
+```
+
+Index bootstrap disks attach only on `start`/`resume` (persistent domain XML).
+Do not format or start an indexer until its bootstrap image is attached.
+
+After both servers reach the Knots height, verify and stop them, stop Ubuntu,
+then promote each stopped standalone bootstrap:
+
+```bash
+./bin/bvml index-bootstrap-verify electrs
+./bin/bvml index-bootstrap-verify fulcrum
+./bin/bvml stop ubuntu
+./bin/bvml index-bootstrap-promote electrs --confirm-index-synced
+./bin/bvml index-bootstrap-promote fulcrum --confirm-index-synced
+```
+
+For consumers, `start` creates missing service overlays automatically when a
+base exists; `resume` attaches retained service overlays.
+`index-adapter-setup VM` and `index-adapter-validate VM` operate Ubuntu's
+pinned services. For Umbrel and StartOS, `guest-index-provision VM` installs
+the exact official native applications (and applies the Fulcrum pre-start
+safety transform that refuses to wipe a mounted overlay). Normal platform
+adapter setup and validation then include index runtime proof. `stop VM`
+stops and unmounts all native index applications before detaching disks.
+`discard VM` removes only that VM's Bitcoin and index overlays.
+
+Never attach an index base directly. Any base or child blocks Bitcoin
+canonical mutation because its database is valid only for that canonical
+generation. After an intentional canonical replacement, rebuild both bases
+before creating new index consumers.
+
+### Electrum listen ports (verification contract)
+
+| Platform | Electrs TCP | Fulcrum TCP |
+|---|---|---|
+| Ubuntu producer/consumer | host `50001` | host `50002` |
+| Umbrel official apps | host `50001` | host `50002` |
+| StartOS Fulcrum package | n/a | **in-subcontainer** `50001`; preferred external publish may be `50002` |
+| StartOS Electrs (community) | **in-subcontainer** `50001` | n/a |
+
+Guest verification always probes the address the process actually binds. On
+StartOS that is the subcontainer loopback port `50001`, not the host preferred
+port.
+
+### Consumer reuse proof
+
+Consumer setup fails closed unless the mounted overlay already contains the
+promoted database layout (`db/bitcoin` for Electrs, `fulc2_db` for Fulcrum 2.x).
+After start, the Electrum height must be within one block of Knots and at or
+above the protected base tip height recorded at promotion. That proves the
+platform opened the reusable base and extended it rather than reindexing from
+genesis.
 
 ## Ubuntu update verification and promotion
 
@@ -163,7 +242,7 @@ from flattened candidates.
 ```
 
 Promotion requires all domains exactly shut off, no attachment, no owner,
-exactly one Ubuntu overlay, a valid backing chain, current evidence, matching
+no non-Ubuntu dependent overlay, a valid Ubuntu backing chain, current evidence, matching
 normalized Knots/RDTS profile digest and observed arguments,
 mainnet/non-XOR/filesystem/index-profile state, a fresh best-block timestamp,
 and clean shutdown. It reports
@@ -235,9 +314,98 @@ directory in `.bvml`; umbrelOS does not retain ordinary writes to `/etc` or
 
 ## StartOS
 
-StartOS remains fail-closed until a version-specific managed package override
-passes the same native lifecycle and runtime proof boundaries. It is not
-described as operational.
+The immutable StartOS profile pins release 0.4.0.1, its installer and CLI,
+official registry metadata/signers, source commit, s9pk commitment and digest,
+package `bitcoind` flavor `#knots:29.3.1:16`, and the bundled Knots executable.
+`create startos` uses the pinned setup API, identifies separate OS/data disks
+by observed model/capacity plus domain serials, executes setup, installs a
+dedicated SSH key, verifies the build, and removes the installer.
+
+`guest-provision startos` queries the official registry, verifies the exact
+commitment and signer set, sideloads the identical digest-pinned official s9pk
+through `start-cli`, stops it, and captures only its generated `bitcoin.conf`
+and `store.json` seed. `adapter-setup` resolves the package LXC and native
+`main` source from LXC configuration, mounts the overlay privately, binds it
+over that source with the package LXC's ID mapping, restores the package seed
+into the overlay, enables RDTS through the native hidden action, and
+starts/restarts only through `start-cli`.
+
+Before provisioning or starting StartOS, build and validate the immutable
+filesystem adapter:
+
+```bash
+./bin/bvml startos-adapter-build --confirm-convert
+./bin/bvml startos-adapter-validate
+./bin/bvml startos-adapter-status
+```
+
+The workflow creates a qcow2 child of the ext4 canonical, attaches it only to
+the Ubuntu maintenance guest, runs a full ext4 check, converts that child with
+`btrfs-convert`, and validates the complete datadir and configured indexes. It
+rejects allocation above the configured absolute or percentage ceiling,
+performs read-only Btrfs checks, removes `ext2_saved`, and protects the finished
+layer read-only and immutable. It verifies that the canonical fingerprint did
+not change. It never runs Btrfs balance or recursive defragmentation.
+
+Each disposable StartOS overlay backs the immutable Btrfs adapter rather than
+the ext4 canonical. The native package consequently sees Btrfs at both
+`/media/startos/volumes/main` and `/root/.bitcoin` and retains its required
+`chattr +C` path. Ubuntu and Umbrel remain direct children of the ext4
+canonical. The adapter and every transitive StartOS overlay block canonical
+mutation. An interrupted conversion is retained with recovery metadata. After
+inspection, resume a `converted-validated` candidate with
+`startos-adapter-resume --confirm-resume`; use
+`startos-adapter-cleanup --confirm-remove-candidate` only when abandoning it.
+Before changing the canonical generation, stop and discard every StartOS
+overlay, then remove the dependent adapter with
+`startos-adapter-remove --confirm-remove`. Rebuild it immediately after the
+new canonical generation is protected.
+
+## Shared basic-filter checkpoint updates
+
+The canonical profile requires `basic block filter index` for Ubuntu, Umbrel,
+and StartOS. For a low-space generation change:
+
+```bash
+./bin/bvml stop startos        # when active
+./bin/bvml discard startos
+./bin/bvml startos-adapter-remove --confirm-remove
+./bin/bvml start ubuntu
+./bin/bvml checkpoint-sync-start
+./bin/bvml profiles-migrate --confirm-checkpoint-migration
+./bin/bvml checkpoint-profile-migrate-guest
+# wait for chain tip and getindexinfo synchronization
+./bin/bvml checkpoint-sync-finish
+./bin/bvml checkpoint-verify
+./bin/bvml checkpoint-commit --confirm-no-rollback
+./bin/bvml startos-adapter-build --confirm-convert
+```
+
+The no-rollback commit is deliberately separate from ordinary promotion. It is
+available only with `ROLLBACK_RETENTION=none`, records recovery state before
+changing canonical, and retains the overlay on failure. It cannot recover from
+physical corruption or a partially failed in-place commit; that policy’s
+disaster recovery is a fresh IBD.
+
+Validation proves the three filesystem views, actual non-PID-1 process,
+official executable digest/version, mainnet synchronization, non-pruned
+configuration, required indexes, `blocksxor=0`, and the `reduced_data`
+deployment from `getdeploymentinfo`. Stop uses the native package stop, rejects
+open files or busy mounts, restores the hidden native volume, then permits VM
+shutdown and detach. Failures preserve only the StartOS lifecycle and recovery
+evidence. StartOS is always a consumer and cannot promote.
+
+Run the real-host stage only on the marked lab storage:
+
+```bash
+BVML_INTEGRATION=1 \
+BVML_CONFIRM_STARTOS_INTEGRATION=1 \
+BVML_INTEGRATION_STORAGE=/dedicated/lab/path \
+./bin/bvml integration-test startos
+```
+
+Until that stage succeeds against the pinned package, report StartOS as
+implemented but not operationally proven.
 
 ## Opt-in real-host integration tests
 
@@ -251,10 +419,13 @@ BVML_INTEGRATION_STORAGE=/dedicated/lab/path \
 ```
 
 Available stages are `cloud`, `bootstrap-finalize`, `ubuntu-smoke`, `umbrel`,
-and `startos`. Bootstrap finalization additionally requires
-`BVML_CONFIRM_DESTRUCTIVE_INTEGRATION=1`. The suite refuses unmarked storage,
-checks canonical immutability/fingerprints around disposable adapter tests, and
-is never part of `bvml test`.
+`concurrency`, and `startos`. The concurrency stage runs Ubuntu and Umbrel
+together with distinct overlays and requires
+`BVML_CONFIRM_CONCURRENCY_INTEGRATION=1`. Bootstrap finalization additionally
+requires `BVML_CONFIRM_DESTRUCTIVE_INTEGRATION=1`; StartOS requires
+`BVML_CONFIRM_STARTOS_INTEGRATION=1`. The suite refuses unmarked
+storage, checks canonical immutability/fingerprints around disposable adapter
+tests, and is never part of `bvml test`.
 
 ## Protection, recovery, space, and backups
 

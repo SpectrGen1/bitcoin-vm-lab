@@ -1,0 +1,113 @@
+{
+  "profile_version": 1,
+  "profile_id": "indexers-mainnet-v1",
+  "bitcoin_checkpoint_profile": "mainnet-basic-filter-txindex-v1",
+  "filesystems": {
+    "base": "btrfs",
+    "overlay": "btrfs"
+  },
+  "electrs": {
+    "version": "0.11.1",
+    "database_layout": "db/bitcoin",
+    "ubuntu": {
+      "image": "getumbrel/electrs:v0.11.1@sha256:f1d5d4e431d39e0aaa0697014d2852880183e350ffcad612edb87183f0c11b25",
+      "binary": "/usr/bin/electrs",
+      "binary_sha256": ""
+    },
+    "umbrel": {
+      "app_id": "electrs",
+      "app_version": "0.11.1-patch.1",
+      "store_commit": "3e3f6760e1358e5aaa782020eb52df2d0021ce90",
+      "host_data_suffix": "app-data/electrs/data/electrs",
+      "container_data": "/data",
+      "database": "/data/db/bitcoin",
+      "service": "electrs",
+      "runtime_uid": 1000,
+      "runtime_gid": 1000,
+      "files": {
+        "umbrel-app.yml": "4406433a41d74c77aa9adf8417630957d41345db3b4e46e1d11ac741df5447a9",
+        "docker-compose.yml": "8a10a14f6a1905bd7beeedf756bd5ec80af93efed01fc1c0498bd6ddd0964eed",
+        "exports.sh": "fd849735a10b7e9f81a4e15b12d291248b87c8af8d33f897f5b1ebc21ff550c0",
+        "hooks/pre-start": "e6bd3702dfb6888f8e5dd7fddbf86d9824e56ebdf7ac50c3bd90b277bfdbe01d"
+      },
+      "installed_files": {
+        "umbrel-app.yml": "4406433a41d74c77aa9adf8417630957d41345db3b4e46e1d11ac741df5447a9",
+        "docker-compose.yml": "9cbce5e1b69421af4556f3d1b229fbbea0ae418b93a996fe0f5668599eea8e84",
+        "exports.sh": "fd849735a10b7e9f81a4e15b12d291248b87c8af8d33f897f5b1ebc21ff550c0",
+        "hooks/pre-start": "3a73fcc1085f4a231086d6e9eff82d10ac25156abaa2975082b83511067906cf"
+      },
+      "image": "getumbrel/electrs:v0.11.1@sha256:f1d5d4e431d39e0aaa0697014d2852880183e350ffcad612edb87183f0c11b25",
+      "ui_image": "getumbrel/umbrel-electrs:v1.0.4@sha256:fa2fd04f4c7515aad84f21640f5feab1417bc18e20bc65cda7ed97e59b8458db"
+    },
+    "startos": {
+      "package_id": "electrs",
+      "package_version": "0.11.1:17",
+      "marketplace": "community",
+      "release_url": "https://github.com/Start9-Community/electrs-startos/releases/download/v0.11.1_17/electrs_x86_64.s9pk",
+      "release_sha256": "d5e03e9fb5184999824d949f1f120b4644cf1d23e1f22419af46a3c6d8b8e158",
+      "source_commit": "f135c3694bafc9dc59dd4e1fa756fbce0722e78c",
+      "volume": "main",
+      "lxc_volume_mount": "/media/startos/volumes/main",
+      "subcontainer": "electrs",
+      "subcontainer_datadir": "/data",
+      "database": "/data/db/bitcoin",
+      "source_files": {
+        "startos/manifest/index.ts": "277895407e36274cdc7d1679eac6fe6e717e2018965839121baeb2267402fa49",
+        "startos/main.ts": "63c1bb41a7ad93e209d19ac6fc4ea437b5d2aa5c90746ebc68d6cd1f8f3f4ae8",
+        "startos/versions/current.ts": "35b61dc24f715a3d1b799b29c373cd7d4f0e1377f3c79253de7a3e681249bd37"
+      }
+    }
+  },
+  "fulcrum": {
+    "version": "2.1.1",
+    "database_layout": "fulc2_db",
+    "ubuntu": {
+      "image": "cculianu/fulcrum:v2.1.1@sha256:72d8b2f9142f83a51c6c3ba2f6931b496a08bede610b28ef2315b87aa1e3bb64",
+      "binary": "/usr/bin/Fulcrum",
+      "binary_sha256": ""
+    },
+    "umbrel": {
+      "app_id": "fulcrum",
+      "app_version": "2.1.1-patch.1",
+      "store_commit": "3e3f6760e1358e5aaa782020eb52df2d0021ce90",
+      "host_data_suffix": "app-data/fulcrum/data/fulcrum",
+      "container_data": "/data",
+      "database": "/data/fulc2_db",
+      "service": "fulcrum",
+      "runtime_uid": 1000,
+      "runtime_gid": 1000,
+      "files": {
+        "umbrel-app.yml": "b6044128a7cb2a4fb978b6d5121b43d0c6c386e4d07cd5a13743d37d42a13d40",
+        "docker-compose.yml": "634bb2cc0cc07c70fc82a8e7f71094e5b55e88fc81d3e87f0a48c74287fdfceb",
+        "exports.sh": "bbbb9d8e45862b47d8667e3949b993d24b1c91ab57c1508335ec9ce52f41a621",
+        "hooks/pre-start": "907826bc05af30bbaa9ddc8ff91470b0d5bfaa618c8f05a4096e3d1c33846c67"
+      },
+      "installed_files": {
+        "umbrel-app.yml": "b6044128a7cb2a4fb978b6d5121b43d0c6c386e4d07cd5a13743d37d42a13d40",
+        "docker-compose.yml": "5f97fb103be36fc55ea8dc6aac7ba6a05f26fbb2c055e074c4f6cc230ad53e79",
+        "exports.sh": "bbbb9d8e45862b47d8667e3949b993d24b1c91ab57c1508335ec9ce52f41a621",
+        "hooks/pre-start": "2aaac24825e51f4122e360178a8ad7eca61b4c364351d6369cc662302c3e14f6"
+      },
+      "image": "cculianu/fulcrum:v2.1.1@sha256:72d8b2f9142f83a51c6c3ba2f6931b496a08bede610b28ef2315b87aa1e3bb64",
+      "ui_image": "nmfretz/umbrel-fulcrum:1.0.1@sha256:7ebcb84446e55dbbde7711a4ac2d65ca65c55d0092e6640b41ca2d9c4539a3ff"
+    },
+    "startos": {
+      "package_id": "fulcrum",
+      "package_version": "2.1.1:12",
+      "release_url": "https://github.com/Start9Labs/fulcrum-startos/releases/download/v2.1.1_12/fulcrum_x86_64.s9pk",
+      "release_sha256": "c205d9a6328abba4088ef47fb7c27584889af55aa80c1058f79d5b24a0037374",
+      "source_commit": "61945834e384d6d927824fd6539d4898c3e5930d",
+      "volume": "main",
+      "lxc_volume_mount": "/media/startos/volumes/main",
+      "subcontainer": "primary-sub",
+      "subcontainer_datadir": "/data",
+      "database": "/data/fulc2_db",
+      "image": "cculianu/fulcrum:v2.1.1",
+      "source_files": {
+        "startos/manifest/index.ts": "d4e6c0e06b1dae930277ce2fc6f13a986904b451f267b4f97759327ea906d4d3",
+        "startos/main.ts": "a5b805c70cf62ebc341fa6ea6c1ca9e5ab0986f2d4756f45dcba719dd0099b44",
+        "startos/versions/current.ts": "6f301d9aeecdd47988a5f25b02d5969375523997c667dd27f94db6102825b5de"
+      }
+    }
+  }
+}

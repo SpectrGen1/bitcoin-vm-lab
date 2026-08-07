@@ -19,4 +19,4 @@ cleanup_partial_vm() {
   note "removed known partial persistent disks for undefined $vm VM"
 }
 
-with_lock cleanup_partial_vm
+with_vm_lock "$vm" cleanup_partial_vm

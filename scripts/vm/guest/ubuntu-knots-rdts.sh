@@ -246,15 +246,33 @@ validate_rdts_runtime() {
   ' <<<"$observed")"
 }
 
+write_checkpoint_indexes_conf() {
+  # Map checkpoint profile index names to bitcoin.conf settings.
+  local conf_extra=()
+  if jq -e '.indexes | index("basic block filter index") != null' \
+       "$CHECKPOINT_PROFILE_FILE" >/dev/null; then
+    conf_extra+=('blockfilterindex=basic')
+  fi
+  if jq -e '.indexes | index("txindex") != null' \
+       "$CHECKPOINT_PROFILE_FILE" >/dev/null; then
+    conf_extra+=('txindex=1')
+  else
+    conf_extra+=('txindex=0')
+  fi
+  printf '%s\n' "${conf_extra[@]}"
+}
+
 install_service() {
-  expected_mount; install_knots; validate_rdts_supported
-  local rdts_args
+  expected_mount; install_knots; validate_rdts_supported; load_profiles
+  local rdts_args index_conf
   rdts_args="$(jq -r 'join(" ")' <<<"$RDTS_REQUIRED_ARGS_JSON")"
+  index_conf="$(write_checkpoint_indexes_conf)"
   sudo install -d -m 0755 /etc/bvml
   sudo tee "$KNOTS_CONFIG" >/dev/null <<EOF
 chain=main
 datadir=$MOUNT
 blocksxor=0
+$index_conf
 EOF
   sudo tee /etc/systemd/system/bvml-knots.service >/dev/null <<EOF
 [Unit]

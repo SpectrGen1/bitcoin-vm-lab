@@ -6,7 +6,8 @@ failed=0
 bad() { echo "FAIL $*" >&2; failed=1; }
 ok() { echo "ok   $*"; }
 
-for cmd in virsh qemu-img flock sha256sum jq xmllint virt-ls virt-cat virt-customize virt-filesystems xorriso file tesseract sshpass; do
+for cmd in virsh qemu-img flock sha256sum jq xmllint virt-ls virt-cat virt-customize \
+  virt-filesystems xorriso file tesseract sshpass; do
   command -v "$cmd" >/dev/null && ok "command $cmd" || bad "missing command $cmd"
 done
 virshq version >/dev/null 2>&1 && ok "libvirt connectivity" || bad "cannot connect to $LIBVIRT_URI"
@@ -23,42 +24,101 @@ done
 if [[ -d "$BVML_STORAGE" ]]; then
   if [[ "${BVML_TESTING:-0}" == 1 ]] || sudo -u "$QEMU_USER" test -x "$BVML_STORAGE"; then
     ok "system QEMU can traverse storage"
-  else bad "system QEMU cannot traverse $BVML_STORAGE"; fi
-else bad "storage missing: run bvml init"; fi
+  else
+    bad "system QEMU cannot traverse $BVML_STORAGE"
+  fi
+else
+  bad "storage missing: run bvml init"
+fi
 
 if [[ -f "$CANONICAL" ]]; then
   canonical_preflight >/dev/null 2>&1 &&
-    ok "canonical full fast preflight (format/layout/profile/protection/QEMU access)" ||
-    bad "canonical full fast preflight failed"
+    ok "canonical full fast preflight" || bad "canonical full fast preflight failed"
 elif [[ -f "$BOOTSTRAP" ]]; then
   ok "canonical absent while fresh bootstrap is $(meta_get "$BOOTSTRAP_META" state)"
 else
   ok "no checkpoint initialized; fresh bootstrap is available"
 fi
-
 if [[ -f "$ROLLBACK" ]]; then
-  validate_checkpoint_image "$ROLLBACK" && ok "rollback independently valid" || bad "rollback checkpoint invalid"
+  validate_checkpoint_image "$ROLLBACK" && ok "rollback independently valid" ||
+    bad "rollback checkpoint invalid"
   [[ ! -w "$ROLLBACK" ]] || bad "rollback is writable"
 fi
-if [[ -e "$OVERLAY" || -e "$OVERLAY_META" ]]; then
-  [[ -f "$OVERLAY" && -f "$OVERLAY_META" ]] || bad "partial overlay state"
-  assert_overlay_chain >/dev/null 2>&1 && ok "overlay backing/generation/ID" || bad "overlay chain or manifest invalid"
+if [[ -f "$STARTOS_LAYER" || -f "$STARTOS_LAYER_META" ]]; then
+  startos_adapter_preflight >/dev/null 2>&1 &&
+    ok "protected StartOS Btrfs adapter/transitive backing chain" ||
+    bad "StartOS Btrfs adapter validation failed"
+elif [[ -e "$STARTOS_LAYER_CANDIDATE" || -e "$STARTOS_LAYER_CANDIDATE_META" ||
+        -e "$STARTOS_LAYER_RECOVERY" ]]; then
+  bad "partial StartOS Btrfs adapter conversion/recovery state"
+else
+  bad "StartOS Btrfs adapter is not initialized"
 fi
-extra="$(find "$ACTIVE_DIR" -maxdepth 1 -type f -name '*.qcow2' \
-  ! -path "$OVERLAY" ! -path "$BOOTSTRAP" -print -quit 2>/dev/null)"
-[[ -z "$extra" ]] || bad "unexpected extra overlay: $extra"
-[[ ! -f "$OVERLAY" || ! -f "$BOOTSTRAP" ]] || bad "ordinary overlay and bootstrap coexist"
 
+for vm in ubuntu umbrel startos; do
+  set_lifecycle_context "$vm"
+  if [[ -e "$OVERLAY" || -e "$OVERLAY_META" ]]; then
+    [[ -f "$OVERLAY" && -f "$OVERLAY_META" ]] || bad "$vm partial overlay state"
+    assert_overlay_chain >/dev/null 2>&1 &&
+      ok "$vm overlay backing/generation/ID" || bad "$vm overlay chain or manifest invalid"
+    for field in owner_state attachment_state mount_state adapter_state recovery_required; do
+      [[ -n "$(meta_get "$OVERLAY_META" "$field")" ]] ||
+        bad "$vm overlay manifest lacks $field"
+    done
+  fi
+  if [[ -f "$VERIFY_META" ]]; then
+    [[ -f "$OVERLAY" && "$(meta_get "$VERIFY_META" overlay_id)" == "$(overlay_id)" ]] ||
+      bad "$vm stale verification evidence"
+  fi
+done
+assert_no_extra_overlays >/dev/null 2>&1 || bad "unexpected overlay image exists"
 errors="$(lifecycle_invariant_errors)"
-[[ -z "$errors" ]] && ok "lifecycle owner/manifest/attachment/process invariants" ||
+[[ -z "$errors" ]] && ok "per-VM owner/manifest/attachment/process invariants" ||
   bad "lifecycle invariant failure: ${errors//$'\n'/; }"
 
-if [[ -f "$VERIFY_META" ]]; then
-  [[ -f "$OVERLAY" && "$(meta_get "$VERIFY_META" overlay_id)" == "$(overlay_id)" ]] ||
-    bad "stale verification evidence"
-fi
+validate_index_profile >/dev/null 2>&1 &&
+  ok "Electrs/Fulcrum pinned index profile" || bad "Electrs/Fulcrum index profile invalid"
+for service in electrs fulcrum; do
+  base="$(index_base "$service")"; bmeta="$(index_base_meta "$service")"
+  bootstrap="$(index_bootstrap "$service")"; bootstrap_meta="$(index_bootstrap_meta "$service")"
+  if { [[ -e "$base" ]] && [[ ! -e "$bmeta" ]]; } ||
+     { [[ ! -e "$base" ]] && [[ -e "$bmeta" ]]; }; then
+    bad "$service has partial protected base state"
+  elif [[ -f "$base" ]]; then
+    index_base_preflight "$service" >/dev/null 2>&1 &&
+      ok "$service protected base integrity/generation/protection" ||
+      bad "$service protected base preflight failed"
+  fi
+  if { [[ -e "$bootstrap" ]] && [[ ! -e "$bootstrap_meta" ]]; } ||
+     { [[ ! -e "$bootstrap" ]] && [[ -e "$bootstrap_meta" ]]; }; then
+    bad "$service has partial bootstrap state"
+  fi
+  [[ ! -e "$base" || ! -e "$bootstrap" ]] ||
+    bad "$service protected base and bootstrap coexist"
+  for vm in ubuntu umbrel startos; do
+    index_supported_for_vm "$vm" "$service" || continue
+    image="$(index_overlay "$vm" "$service")"; imeta="$(index_overlay_meta "$vm" "$service")"
+    if { [[ -e "$image" ]] && [[ ! -e "$imeta" ]]; } ||
+       { [[ ! -e "$image" ]] && [[ -e "$imeta" ]]; }; then
+      bad "$vm $service has partial overlay state"
+    elif [[ -f "$image" ]]; then
+      index_overlay_preflight "$vm" "$service" >/dev/null 2>&1 &&
+        ok "$vm $service overlay backing/generation" ||
+        bad "$vm $service overlay preflight failed"
+      attached="$(attached_vm_for_path "$image" | paste -sd, -)"
+      [[ -z "$attached" || "$attached" == "$vm" ]] ||
+        bad "$vm $service overlay is attached to '${attached:-none}'"
+    fi
+  done
+done
+for service in electrs fulcrum; do
+  [[ -z "$(attached_vm_for_path "$(index_base "$service")")" ]] ||
+    bad "$service protected base is attached directly"
+done
+
 if [[ -f "$BOOTSTRAP_VERIFY" ]]; then
-  [[ -f "$BOOTSTRAP" && "$(meta_get "$BOOTSTRAP_VERIFY" bootstrap_id)" == "$(meta_get "$BOOTSTRAP_META" bootstrap_id)" ]] ||
+  [[ -f "$BOOTSTRAP" &&
+     "$(meta_get "$BOOTSTRAP_VERIFY" bootstrap_id)" == "$(meta_get "$BOOTSTRAP_META" bootstrap_id)" ]] ||
     bad "stale bootstrap verification evidence"
 fi
 
@@ -68,7 +128,7 @@ for v in KNOTS_VERSION_NORMALIZED KNOTS_ARTIFACT_SHA256 KNOTS_RELEASE_PROFILE \
   [[ -n "${!v:-}" ]] || bad "$v not configured"
 done
 if [[ -f "$KNOTS_RDTS_PROFILE" && -n "$KNOTS_RDTS_PROFILE_SHA256" ]]; then
-  [[ "$(sha256sum "$KNOTS_RDTS_PROFILE" | awk '{print $1}')" == "$KNOTS_RDTS_PROFILE_SHA256" ]] ||
+  [[ "$(sha256sum "$KNOTS_RDTS_PROFILE" | awk '{print $1}')" == "${KNOTS_RDTS_PROFILE_SHA256,,}" ]] ||
     bad "RDTS profile authenticated digest mismatch"
 fi
 if [[ -f "$KNOTS_RELEASE_PROFILE" && "$KNOTS_RELEASE_PROFILE_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
@@ -80,45 +140,28 @@ jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
   bad "host-approved RDTS required arguments must be a nonempty JSON string array"
 validate_checkpoint_profile >/dev/null 2>&1 && ok "checkpoint index profile digest/structure" ||
   bad "checkpoint index profile is missing, malformed, or has the wrong digest"
-[[ "$MAX_TIP_AGE_SECONDS" =~ ^[1-9][0-9]*$ ]] || bad "MAX_TIP_AGE_SECONDS must be a positive integer"
-for vm in ubuntu umbrel startos; do
-  if [[ "$vm" == ubuntu && "$UBUNTU_IMAGE_MODE" == cloud ]]; then
-    if [[ -f "$UBUNTU_CLOUD_IMAGE" && "$UBUNTU_CLOUD_IMAGE_SHA256" =~ ^[0-9a-fA-F]{64}$ &&
-          "$(sha256sum "$UBUNTU_CLOUD_IMAGE" | awk '{print $1}')" == "${UBUNTU_CLOUD_IMAGE_SHA256,,}" ]]; then
-      qemu-img check "$UBUNTU_CLOUD_IMAGE" >/dev/null &&
-        ok "Ubuntu cloud image digest/format check" || bad "Ubuntu cloud image qemu-img check failed"
-    else
-      bad "Ubuntu cloud image is missing or does not match its pinned digest"
-    fi
-    [[ "$UBUNTU_CLOUD_SSH_KEY" == /* && -f "$UBUNTU_CLOUD_SSH_KEY" ]] &&
-      ok "Ubuntu cloud SSH public key" || bad "Ubuntu cloud SSH public key is missing"
-    [[ -r "$LIBGUESTFS_APPLIANCE_PATH/kernel" && -r "$LIBGUESTFS_APPLIANCE_PATH/initrd" &&
-       -r "$LIBGUESTFS_APPLIANCE_PATH/root" ]] ||
-      bad "libguestfs appliance is incomplete at $LIBGUESTFS_APPLIANCE_PATH"
-    continue
-  fi
-  iso_var="${vm^^}_ISO"; sum_var="${vm^^}_ISO_SHA256"; iso="${!iso_var:-}"; sum="${!sum_var:-}"
-  [[ -n "$iso" && -f "$iso" && "$sum" =~ ^[0-9a-fA-F]{64}$ ]] ||
-    { bad "$vm installation media/checksum not configured"; continue; }
-  [[ "$(sha256sum "$iso" | awk '{print $1}')" == "${sum,,}" ]] &&
-    ok "$vm installation media checksum" || bad "$vm installation media checksum mismatch"
-done
+[[ "$MAX_TIP_AGE_SECONDS" =~ ^[1-9][0-9]*$ ]] || bad "MAX_TIP_AGE_SECONDS must be positive"
+
+if [[ -f "$STARTOS_PROFILE" &&
+   "$(sha256sum "$STARTOS_PROFILE" | awk '{print $1}')" == "${STARTOS_PROFILE_SHA256,,}" ]] &&
+   jq -e '.os.release=="0.4.0.1" and .registry.package_id=="bitcoind" and
+     .registry.package_version=="#knots:29.3.1:16" and
+     .package.subcontainer=="bitcoind-sub" and
+     .package.subcontainer_datadir=="/root/.bitcoin"' "$STARTOS_PROFILE" >/dev/null; then
+  ok "StartOS immutable OS/package adapter profile"
+else
+  bad "StartOS profile is missing, malformed, or has the wrong digest"
+fi
+if [[ -f "$STARTOS_ISO" ]]; then
+  [[ "$(sha256sum "$STARTOS_ISO" | awk '{print $1}')" == "${STARTOS_ISO_SHA256,,}" ]] &&
+    ok "StartOS installer digest" || bad "StartOS installer digest mismatch"
+fi
+if [[ -f "$STARTOS_PACKAGE" ]]; then
+  [[ "$(sha256sum "$STARTOS_PACKAGE" | awk '{print $1}')" == "${STARTOS_PACKAGE_SHA256,,}" ]] &&
+    ok "StartOS official Knots s9pk digest" || bad "StartOS package digest mismatch"
+fi
+
 for platform in umbrel startos; do
-  if [[ "$platform" == umbrel ]]; then
-    [[ -f "$UMBREL_PROFILE" && -x "$ROOT/scripts/vm/guest/umbrel-adapter.sh" &&
-       "$(sha256sum "$UMBREL_PROFILE" | awk '{print $1}')" == "${UMBREL_PROFILE_SHA256,,}" ]] ||
-      bad "Umbrel immutable profile or native-package adapter is missing"
-    if [[ -f "$UMBREL_ISO" ]]; then
-      [[ "$(sha256sum "$UMBREL_ISO" | awk '{print $1}')" == "${UMBREL_ISO_SHA256,,}" &&
-         -f "$UMBREL_ISO.manifest.json" ]] &&
-        ok "Umbrel installer is digest-pinned and profile-bound" ||
-        bad "Umbrel installer or generation manifest is invalid"
-    fi
-  else
-    [[ -f "$ROOT/templates/$platform/profile.env.example" &&
-       -x "$ROOT/scripts/vm/guest/$platform-adapter.sh" ]] ||
-      bad "$platform package adapter module missing"
-  fi
   metadata="$ADAPTER_STATE_DIR/$platform.json"
   if [[ -f "$metadata" ]] && jq -e --arg platform "$platform" '
     .platform == $platform and .last_validation_result == "ok" and
@@ -127,14 +170,12 @@ for platform in umbrel startos; do
   ' "$metadata" >/dev/null; then
     ok "$platform verified guest adapter profile metadata"
   else
-    bad "$platform has no current verified guest adapter metadata (adapter remains unavailable)"
+    bad "$platform has no current verified guest adapter metadata"
   fi
 done
 
 if [[ -d "$BVML_STORAGE" ]]; then
   available="$(df -B1 --output=avail "$BVML_STORAGE" | tail -1 | tr -d ' ')"
-  bootstrap_required=$((BOOTSTRAP_SIZE_GIB * 1073741824))
-  echo "info available_bytes=$available bootstrap_virtual_bytes=$bootstrap_required"
-  [[ -f "$CANONICAL" ]] && echo "info promotion_rollback_estimate_bytes=$(du -B1 "$CANONICAL" | awk '{print $1}')"
+  echo "info available_bytes=$available dependent_overlays=$(dependent_overlay_count)"
 fi
 exit "$failed"

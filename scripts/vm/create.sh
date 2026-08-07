@@ -9,6 +9,52 @@ need qemu-img; need virt-install; need virsh; need sha256sum
 assert_provisioning_safe
 is_defined "$vm" && die "$(domain "$vm") already exists"
 
+if [[ "$vm" == startos ]]; then
+  [[ -f "$STARTOS_PROFILE" &&
+     "$(sha256sum "$STARTOS_PROFILE" | awk '{print $1}')" == "${STARTOS_PROFILE_SHA256,,}" ]] ||
+    die "pinned StartOS profile is missing or invalid"
+  [[ -f "$STARTOS_ISO" && -f "$STARTOS_ISO.manifest.json" &&
+     -x "$STARTOS_CLI" ]] || die "run 'bvml media-fetch startos' first"
+  [[ "$(sha256sum "$STARTOS_ISO" | awk '{print $1}')" == "${STARTOS_ISO_SHA256,,}" &&
+     "$(sha256sum "$STARTOS_PACKAGE" | awk '{print $1}')" == "${STARTOS_PACKAGE_SHA256,,}" &&
+     "$(sha256sum "$STARTOS_CLI" | awk '{print $1}')" == "$(jq -r .os.start_cli_sha256 "$STARTOS_PROFILE")" ]] ||
+    die "staged StartOS installer/package/CLI digest mismatch"
+  jq -e --arg profile "${STARTOS_PROFILE_SHA256,,}" \
+    --arg iso "${STARTOS_ISO_SHA256,,}" --arg package "${STARTOS_PACKAGE_SHA256,,}" '
+      .platform=="startos" and .profile_digest==$profile and
+      .iso_sha256==$iso and .package_sha256==$package
+    ' "$STARTOS_ISO.manifest.json" >/dev/null ||
+    die "StartOS media manifest differs from active pinned inputs"
+  vmdir="$(vm_dir startos)"
+  if [[ -d "$vmdir" ]] && find "$vmdir" -mindepth 1 -print -quit | grep -q .; then
+    die "partial StartOS disk state exists; use create-cleanup after review"
+  fi
+  install -d -m 0750 "$vmdir"
+  command -v setfacl >/dev/null && setfacl -m "u:$QEMU_USER:--x" "$vmdir" || true
+  qemu-img create -f qcow2 "$vmdir/system.qcow2" "${STARTOS_SYSTEM_DISK_GIB}G"
+  qemu-img create -f qcow2 "$vmdir/application.qcow2" "${APP_DISK_GIB}G"
+  chmod 0660 "$vmdir"/*.qcow2
+  command -v setfacl >/dev/null && setfacl -m "u:$QEMU_USER:rw-" "$vmdir"/*.qcow2 || true
+  qemu-img check "$vmdir/system.qcow2" >/dev/null
+  qemu-img check "$vmdir/application.qcow2" >/dev/null
+  boot=(); [[ "$BVML_BOOT_UEFI" == 1 ]] && boot=(--boot uefi)
+  virt-install --connect "$LIBVIRT_URI" --name "$(domain startos)" \
+    --memory "$VM_MEMORY_MIB" --vcpus "$VM_CPUS" --cpu host-passthrough \
+    --virt-type kvm --os-variant generic "${boot[@]}" \
+    --disk "path=$vmdir/system.qcow2,format=qcow2,bus=virtio,serial=$STARTOS_INSTALL_SERIAL,boot_order=2" \
+    --disk "path=$vmdir/application.qcow2,format=qcow2,bus=virtio,serial=$STARTOS_DATA_SERIAL,boot_order=3" \
+    --disk "path=$STARTOS_ISO,device=cdrom,bus=sata,readonly=on,serial=BVML-STARTOS-INST,boot_order=1" \
+    --network "network=$BVML_NETWORK,model=virtio" \
+    --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0 \
+    --graphics spice --video virtio --serial pty --noautoconsole --wait 0
+  "$BVML_ROOT/scripts/vm/startos-install.sh"
+  [[ -z "$(virshq domblklist "$(domain startos)" --details |
+    awk -v source="$STARTOS_ISO" '$4==source {print $3}')" ]] ||
+    die "StartOS installer remains attached"
+  note "created and automatically provisioned pinned StartOS VM"
+  return
+fi
+
 if [[ "$vm" == umbrel ]]; then
   [[ -f "$UMBREL_PROFILE" &&
      "$(sha256sum "$UMBREL_PROFILE" | awk '{print $1}')" == "${UMBREL_PROFILE_SHA256,,}" ]] ||

@@ -1,0 +1,81 @@
+{
+  "profile_id": "startos-0.4.0.1-bitcoind-knots-29.3.1-16",
+  "adapter_implementation_version": "2",
+  "os": {
+    "release": "0.4.0.1",
+    "build_commit": "fdb27c73db6ef280eae42dc6b01fd16de0c9b175",
+    "installed_git_info": "fdb27c73db6ef280eae42dc6b01fd16de0c9b175",
+    "start_cli_git_info": "e7ed569935a73b1af39aacf1c476e6e97c8d405f",
+    "iso_url": "https://startos-images.nyc3.cdn.digitaloceanspaces.com/v0.4.0.1/startos-0.4.0.1-fdb27c7_x86_64.iso",
+    "iso_sha256": "9f4f5ad4ece2dc349b0a7b6221b542b26112fe753657024487fc26ef6cf08072",
+    "iso_label": "STARTOS",
+    "disk_identity": {
+      "vendor": "0x1af4",
+      "model": null
+    },
+    "installer_prompts": {
+      "target_disk": "Select a disk to install StartOS",
+      "confirm": "All data on the selected disk will be erased",
+      "complete": "Installation complete"
+    },
+    "start_cli_url": "https://github.com/Start9Labs/start-technologies/releases/download/start-cli/v1.1.0/start-cli_x86_64-linux",
+    "start_cli_sha256": "70eff67b6e9a936acd8aaaf787b783819252ecedaa5c74d462e3b15ed4dd843a",
+    "start_cli_version": "1.1.0",
+    "management_root": "/media/startos/data/main/bvml"
+  },
+  "registry": {
+    "name": "Start9 official registry",
+    "url": "https://registry.start9.com/",
+    "package_id": "bitcoind",
+    "package_version": "#knots:29.3.1:16",
+    "expected_signers": [
+      "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAGaAYxsY7iO5GyQrCA5vcLWYIQyoKImp0du4WWvIzr2Y=\n-----END PUBLIC KEY-----\n",
+      "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEASv7fB+rs6FRL+pk7KXaoXONNn26dRkwMB9LXUqmXXLM=\n-----END PUBLIC KEY-----\n"
+    ],
+    "release_url": "https://github.com/Start9Labs/bitcoin-knots-startos/releases/download/v29.3.1_16-knots/bitcoind_x86_64.s9pk",
+    "release_sha256": "909683c4040ddb5392e0b604774cb94092de6d40063d2f1e2cfcaeacf46280af",
+    "root_sighash": "zQO/Z71s25vINDa6yApLaZeP1m64iokH4uD1sk4Fn88",
+    "source_commit": "662ba72092b76444bb252acfe2ffbb29e6042703",
+    "manifest_sha256": "74e56bdcf146c76e732a0e4c47a3a4dc91c000f39c7288cd62024f892f356f73",
+    "source_file_sha256": {
+      "startos/manifest/index.ts": "2932b4ae2f07f0d1fbbd6b3eb826bd7a25ec92b1798cfaa556c7b8c13935ff4f",
+      "startos/main.ts": "8a323e46e16dc7629665f5c3e55c6cf10cd38932e42e9854d6b17d86cddc3d1c",
+      "startos/versions/current.ts": "f3d667d354104f94edacbb9edf11ae6e25adae6c043a176b49ebbe753eaa2835",
+      "startos/actions/activaterdts.ts": "f3c814d0fb4312c9679b915967570ada6d0221a9ffa188df6f9f4836fcb4f797",
+      "startos/fileModels/bitcoin.conf.ts": "4089c059012d2a55a565dc758cd8cccefa1fe217cd66d16535bc927b1f5ad7ce",
+      "startos/fileModels/store.json.ts": "9a79224f73d849a62c2f0fd18e7974f7c33d0ef1fe94fba5f803ceb9beb278cb",
+      "startos/utils.ts": "ffe7b417892f5da7bf41342cc00879db33f6257ee40dcb74d2ea159777bcdf04"
+    }
+  },
+  "package": {
+    "id": "bitcoind",
+    "flavor_version": "#knots:29.3.1:16",
+    "knots_version_normalized": "29.3.knots20260508",
+    "knots_executable": "/opt/bitcoin/bin/bitcoind",
+    "knots_binary_sha256": "2e6d7a8c9c199c710aa43226e869b02ee5a9c448a67b41b602ca0a329b326e30",
+    "lxc_volume_mount": "/media/startos/volumes/main",
+    "subcontainer": "bitcoind-sub",
+    "subcontainer_datadir": "/root/.bitcoin",
+    "volumes": [
+      "main",
+      "i2pd"
+    ],
+    "seed_files": [
+      "bitcoin.conf",
+      "store.json"
+    ],
+    "rdts_action": "activate-rdts",
+    "rdts_deployment": "reduced_data",
+    "stop_timeout_seconds": 360
+  },
+  "checkpoint": {
+    "network": "main",
+    "blocksxor": 0,
+    "prune": 0,
+    "required_indexes": [
+      "basic block filter index",
+      "txindex"
+    ],
+    "profile_id": "mainnet-basic-filter-txindex-v1"
+  }
+}

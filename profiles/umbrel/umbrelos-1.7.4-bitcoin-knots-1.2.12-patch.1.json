@@ -47,7 +47,10 @@
     "compose_project": "bitcoin-knots",
     "compose_service": "app",
     "network_mode": "umbrel_main_network",
-    "published_ports": [9332, 9333],
+    "published_ports": [
+      9332,
+      9333
+    ],
     "runtime_uid": 1000,
     "runtime_gid": 1000,
     "restart_policy": "on-failure",
@@ -55,8 +58,13 @@
     "image": "ghcr.io/retropex/umbrel-bitcoin-knots:1.2.12@sha256:498a54d5e65acce0ccc5c1881534033bb0f10939e8a371ef17dcf4409a56e891",
     "image_index_digest": "sha256:498a54d5e65acce0ccc5c1881534033bb0f10939e8a371ef17dcf4409a56e891",
     "image_amd64_digest": "sha256:93fb25c2ae26b550fb97a3f0e92cb7d36f684208817858973ddd3427dd5b7285",
-    "entrypoint": ["docker-entrypoint.sh"],
-    "command": ["node", "dist/server.js"],
+    "entrypoint": [
+      "docker-entrypoint.sh"
+    ],
+    "command": [
+      "node",
+      "dist/server.js"
+    ],
     "tor_image": "ghcr.io/getumbrel/tor:0.4.9.11@sha256:e382b8629c0dfef6ceb396b062622d4e4e955b19d6f16b883fd2c0723ad5671a",
     "i2p_image": "purplei2p/i2pd:release-2.59.0@sha256:257653c18ce0b127ef480e3d8373b3ddbf1495e842674c8cfc59909be0015979"
   },
@@ -71,23 +79,38 @@
       "version": "v29.3.knots20260508",
       "consensusrules": true,
       "prune": 0,
-      "txindex": false,
-      "blockfilterindex": false,
-      "peerblockfilters": false
+      "txindex": true,
+      "blockfilterindex": true,
+      "peerblockfilters": true
     },
     "required_generated_config": {
       "consensusrules": "rdts"
     },
-    "base_config": ["blocksxor=0"],
-    "checkpoint_profile_id": "mainnet-no-indexes-v1",
-    "checkpoint_profile_sha256": "6d99ab029148f9bcb19d10abf7270ef3d2c8f7b4ae022c9e3ac81122ca6b03fa",
-    "required_indexes": []
+    "base_config": [
+      "blocksxor=0"
+    ],
+    "checkpoint_profile_id": "mainnet-basic-filter-txindex-v1",
+    "checkpoint_profile_sha256": "dd756087a607d297655db81e7b3f92583143e26cbd9b30394c69cd3836a8f0ff",
+    "required_indexes": [
+      "basic block filter index"
+    ],
+    "txindex": true,
+    "blockfilterindex": true
   },
   "runtime": {
     "device": "/dev/vdc",
     "container_datadir": "/data/bitcoin",
-    "required_sidecars": ["tor", "i2pd_daemon"],
-    "required_zmq_ports": [48332, 48333, 48334, 48335, 48336],
+    "required_sidecars": [
+      "tor",
+      "i2pd_daemon"
+    ],
+    "required_zmq_ports": [
+      48332,
+      48333,
+      48334,
+      48335,
+      48336
+    ],
     "max_tip_age_seconds": 86400
   }
 }

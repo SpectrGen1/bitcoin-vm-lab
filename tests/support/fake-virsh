@@ -19,12 +19,24 @@ case "$cmd" in
   attach-disk)
     vm="$(vm_from_domain "$1")"; source="$2"; target="$3"
     [[ ! -e "$TEST_ROOT/fail-attach" ]] || exit 1
-    printf '%s %s\n' "$target" "$source" >"$TEST_ROOT/attach-$vm"
+    if [[ -f "$TEST_ROOT/attach-$vm" ]]; then
+      awk -v target="$target" '$1 != target' "$TEST_ROOT/attach-$vm" >"$TEST_ROOT/attach-$vm.new"
+      mv "$TEST_ROOT/attach-$vm.new" "$TEST_ROOT/attach-$vm"
+    fi
+    printf '%s %s\n' "$target" "$source" >>"$TEST_ROOT/attach-$vm"
     printf 'attach %s %s\n' "$vm" "$source" >>"$TEST_ROOT/virsh.log"
     ;;
   detach-disk)
-    vm="$(vm_from_domain "$1")"; [[ ! -e "$TEST_ROOT/fail-detach" ]] || exit 1
-    rm -f -- "$TEST_ROOT/attach-$vm"; printf 'detach %s\n' "$vm" >>"$TEST_ROOT/virsh.log"
+    vm="$(vm_from_domain "$1")"; target="$2"; [[ ! -e "$TEST_ROOT/fail-detach" ]] || exit 1
+    if [[ -f "$TEST_ROOT/attach-$vm" ]]; then
+      awk -v target="$target" '$1 != target' "$TEST_ROOT/attach-$vm" >"$TEST_ROOT/attach-$vm.new"
+      if [[ -s "$TEST_ROOT/attach-$vm.new" ]]; then
+        mv "$TEST_ROOT/attach-$vm.new" "$TEST_ROOT/attach-$vm"
+      else
+        rm -f -- "$TEST_ROOT/attach-$vm.new" "$TEST_ROOT/attach-$vm"
+      fi
+    fi
+    printf 'detach %s %s\n' "$vm" "$target" >>"$TEST_ROOT/virsh.log"
     ;;
   start)
     vm="$(vm_from_domain "$1")"; [[ ! -e "$TEST_ROOT/fail-start" ]] || exit 1

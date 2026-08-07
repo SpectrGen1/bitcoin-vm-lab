@@ -25,9 +25,6 @@ if [[ -n "$ROLLBACK_DESTINATION" ]]; then
   ROLLBACK_META="$ROLLBACK_DESTINATION/rollback-manifest.env"
 fi
 ACTIVE_DIR="$BVML_STORAGE/active"
-OVERLAY="$ACTIVE_DIR/bitcoin-mainnet-overlay.qcow2"
-OVERLAY_META="$ACTIVE_DIR/manifest.env"
-VERIFY_META="$ACTIVE_DIR/ubuntu-verification.env"
 BOOTSTRAP="$ACTIVE_DIR/bitcoin-mainnet-bootstrap.qcow2"
 BOOTSTRAP_META="$ACTIVE_DIR/bootstrap-manifest.env"
 BOOTSTRAP_VERIFY="$ACTIVE_DIR/bootstrap-verification.env"
@@ -36,19 +33,105 @@ IMPORT_META="$CANONICAL_DIR/import-candidate-manifest.env"
 BOOTSTRAP_CANDIDATE="$CANONICAL_DIR/bootstrap-promotion-candidate.qcow2"
 BOOTSTRAP_CANDIDATE_META="$CANONICAL_DIR/bootstrap-promotion-manifest.env"
 RUN_DIR="$BVML_STORAGE/run"
-OWNER_FILE="$RUN_DIR/owner.env"
-LOCK_FILE="$RUN_DIR/storage.lock"
+LIFECYCLE_ROOT="$RUN_DIR/lifecycles"
+GLOBAL_LOCK_FILE="$RUN_DIR/canonical.lock"
+LOCK_FILE="$GLOBAL_LOCK_FILE"
 RECOVERY_META="$RUN_DIR/recovery.env"
 ADAPTER_STATE_DIR="$RUN_DIR/adapters"
-ADAPTER_RECOVERY_META="$RUN_DIR/umbrel-recovery.env"
+STARTOS_LAYER_DIR="$BVML_STORAGE/adapters/startos"
+STARTOS_LAYER="$STARTOS_LAYER_DIR/bitcoin-mainnet-btrfs.qcow2"
+STARTOS_LAYER_META="$STARTOS_LAYER_DIR/manifest.env"
+STARTOS_LAYER_CANDIDATE="$STARTOS_LAYER_DIR/conversion-candidate.qcow2"
+STARTOS_LAYER_CANDIDATE_META="$STARTOS_LAYER_DIR/conversion-candidate.env"
+STARTOS_LAYER_RECOVERY="$STARTOS_LAYER_DIR/recovery.env"
+STARTOS_LAYER_LOCK="$STARTOS_LAYER_DIR/adapter.lock"
+INDEX_ROOT="$BVML_STORAGE/indexes"
+INDEX_RUN_ROOT="$RUN_DIR/indexes"
+LEGACY_OVERLAY="$ACTIVE_DIR/bitcoin-mainnet-overlay.qcow2"
+LEGACY_OVERLAY_META="$ACTIVE_DIR/manifest.env"
+LEGACY_VERIFY_META="$ACTIVE_DIR/ubuntu-verification.env"
+LEGACY_OWNER_FILE="$RUN_DIR/owner.env"
+LEGACY_ADAPTER_RECOVERY_META="$RUN_DIR/umbrel-recovery.env"
+
+lifecycle_dir() { printf '%s/%s' "$LIFECYCLE_ROOT" "$1"; }
+lifecycle_active_dir() { printf '%s/%s' "$ACTIVE_DIR" "$1"; }
+lifecycle_overlay() { printf '%s/bitcoin-mainnet-overlay.qcow2' "$(lifecycle_active_dir "$1")"; }
+lifecycle_meta() { printf '%s/manifest.env' "$(lifecycle_dir "$1")"; }
+lifecycle_owner() { printf '%s/owner.env' "$(lifecycle_dir "$1")"; }
+lifecycle_verify() { printf '%s/verification.env' "$(lifecycle_dir "$1")"; }
+lifecycle_recovery() { printf '%s/recovery.env' "$(lifecycle_dir "$1")"; }
+lifecycle_lock() { printf '%s/lifecycle.lock' "$(lifecycle_dir "$1")"; }
+valid_index_service() {
+  [[ "${1:-}" =~ ^(electrs|fulcrum)$ ]] ||
+    die "index service must be electrs or fulcrum"
+}
+index_supported_for_vm() {
+  local vm="$1" service="$2"
+  valid_vm "$vm"; valid_index_service "$service"
+  # Ubuntu and Umbrel run both Electrs and Fulcrum. StartOS runs both via the
+  # official Fulcrum package and the community Electrs package.
+  return 0
+}
+index_base_dir() { valid_index_service "$1"; printf '%s/%s' "$INDEX_ROOT" "$1"; }
+index_base() { printf '%s/base.qcow2' "$(index_base_dir "$1")"; }
+index_base_meta() { printf '%s/manifest.env' "$(index_base_dir "$1")"; }
+index_bootstrap() { printf '%s/bootstrap.qcow2' "$(index_base_dir "$1")"; }
+index_bootstrap_meta() { printf '%s/bootstrap-manifest.env' "$(index_base_dir "$1")"; }
+index_bootstrap_verify() { printf '%s/bootstrap-verification.json' "$(index_base_dir "$1")"; }
+index_service_dir() { printf '%s/services/%s' "$(lifecycle_dir "$1")" "$2"; }
+index_overlay() { printf '%s/%s-overlay.qcow2' "$(lifecycle_active_dir "$1")" "$2"; }
+index_overlay_meta() { printf '%s/manifest.env' "$(index_service_dir "$1" "$2")"; }
+index_recovery() { printf '%s/recovery.env' "$(index_service_dir "$1" "$2")"; }
+index_target() {
+  case "$1" in electrs) printf vdd ;; fulcrum) printf vde ;; *) valid_index_service "$1" ;; esac
+}
+index_device() {
+  case "$1" in electrs) printf '%s' "$INDEX_DEVICE_ELECTRS" ;;
+    fulcrum) printf '%s' "$INDEX_DEVICE_FULCRUM" ;; *) valid_index_service "$1" ;; esac
+}
+index_serial_prefix() {
+  case "$1" in electrs) printf BVMLE ;; fulcrum) printf BVMLF ;; *) valid_index_service "$1" ;; esac
+}
+index_services_for_vm() {
+  case "$1" in
+    ubuntu|umbrel|startos) printf '%s\n' electrs fulcrum ;;
+    *) valid_vm "$1" ;;
+  esac
+}
+backing_image_for_vm() {
+  if [[ "$1" == startos ]]; then printf '%s' "$STARTOS_LAYER"
+  else printf '%s' "$CANONICAL"
+  fi
+}
+
+set_lifecycle_context() {
+  local vm="$1"; valid_vm "$vm"
+  LIFECYCLE_VM="$vm"
+  OVERLAY="$(lifecycle_overlay "$vm")"
+  OVERLAY_META="$(lifecycle_meta "$vm")"
+  OWNER_FILE="$(lifecycle_owner "$vm")"
+  VERIFY_META="$(lifecycle_verify "$vm")"
+  ADAPTER_RECOVERY_META="$(lifecycle_recovery "$vm")"
+}
 
 die() { echo "error: $*" >&2; exit 1; }
 note() { echo "==> $*"; }
 need() { command -v "$1" >/dev/null || die "missing command: $1"; }
 domain() { printf 'bvml-%s' "$1"; }
 valid_vm() { [[ "${1:-}" =~ ^(ubuntu|umbrel|startos)$ ]] || die "VM must be ubuntu, umbrel, or startos"; }
+# Ubuntu is the default only for producer/bootstrap functions that predate explicit
+# lifecycle arguments. Consumer commands always select their VM before acting.
+set_lifecycle_context ubuntu
 vm_dir() { printf '%s/vms/%s' "$BVML_STORAGE" "$1"; }
 virshq() { virsh -c "$LIBVIRT_URI" "$@"; }
+qemu_img_info_json() {
+  local image="$1"
+  if [[ -r "$image" ]]; then
+    qemu-img info --force-share --output=json "$image"
+  else
+    sudo -n -u "$QEMU_USER" qemu-img info --force-share --output=json "$image"
+  fi
+}
 guest_exec_request_json() {
   local path="$1"; shift
   jq -cn --arg path "$path" --args '$ARGS.positional |
@@ -86,9 +169,13 @@ guest_exec_sync() {
 domain_ipv4() {
   local vm="$1" address
   address="$({ virshq domifaddr "$(domain "$vm")" --source agent 2>/dev/null || true; } |
-    awk '$3 == "ipv4" {sub(/\/.*/, "", $4); print $4; exit}')"
+    awk '$3 == "ipv4" && $4 !~ /^127\./ && $4 !~ /^169\.254\./ {
+      sub(/\/.*/, "", $4); print $4; exit
+    }')"
   [[ -n "$address" ]] || address="$({ virshq domifaddr "$(domain "$vm")" --source lease 2>/dev/null || true; } |
-    awk '$3 == "ipv4" {sub(/\/.*/, "", $4); print $4; exit}')"
+    awk '$3 == "ipv4" && $4 !~ /^127\./ && $4 !~ /^169\.254\./ {
+      sub(/\/.*/, "", $4); print $4; exit
+    }')"
   printf '%s\n' "$address"
 }
 umbrel_exec_sync() {
@@ -100,8 +187,7 @@ umbrel_exec_sync() {
   [[ "$UMBREL_SSH_PRIVATE_KEY" == /* && -f "$UMBREL_SSH_PRIVATE_KEY" ]] ||
     die "Umbrel QGA is unavailable and UMBREL_SSH_PRIVATE_KEY is not configured"
   local address="${UMBREL_MANAGEMENT_ADDRESS:-}" output status password remote_command arg
-  [[ -n "$address" ]] || address="$(domain_ipv4 umbrel)"
-  [[ "$address" =~ ^[A-Za-z0-9:.%-]+$ ]] || die "could not resolve a safe Umbrel management address"
+  local waited=0 attempt_timeout
   [[ "$UMBREL_CREDENTIALS_FILE" == /* && -f "$UMBREL_CREDENTIALS_FILE" ]] ||
     die "Umbrel SSH management requires the protected UMBREL_CREDENTIALS_FILE"
   password="$(jq -er '.password | select(type=="string" and length>=12)' "$UMBREL_CREDENTIALS_FILE")" ||
@@ -110,27 +196,94 @@ umbrel_exec_sync() {
   for arg in "$@"; do
     printf -v remote_command '%s %q' "$remote_command" "$arg"
   done
-  local attempt
-  for attempt in 1 2 3 4 5; do
-    set +e
-    output="$(printf '%s\n' "$password" | timeout "$timeout" ssh -i "$UMBREL_SSH_PRIVATE_KEY" \
-      -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
-      "$UMBREL_SSH_USER@$address" "$remote_command" 2>&1)"
-    status=$?
-    set -e
-    (( status != 0 )) &&
-      grep -Eq 'incorrect password attempt|no password was provided' <<<"$output" &&
-      (( attempt < 5 )) || break
+  while :; do
+    if virshq qemu-agent-command "$(domain umbrel)" \
+      '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+      unset password
+      guest_exec_sync umbrel "$path" "$timeout" "$@"
+      return
+    fi
+    [[ -n "$address" ]] || address="$(domain_ipv4 umbrel)"
+    if [[ ! "$address" =~ ^[A-Za-z0-9:.%-]+$ ]]; then
+      status=255
+      output="Umbrel management address is not available"
+    else
+      attempt_timeout=$((timeout-waited))
+      (( attempt_timeout > 0 )) || break
+      set +e
+      output="$(printf '%s\n' "$password" | timeout "$attempt_timeout" ssh -i "$UMBREL_SSH_PRIVATE_KEY" \
+        -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+        "$UMBREL_SSH_USER@$address" "$remote_command" 2>&1)"
+      status=$?
+      set -e
+      (( status == 0 )) && break
+      if (( status != 255 && status != 124 )) ||
+        ! grep -Eqi 'connection refused|no route to host|connection timed out|operation timed out|network is unreachable' <<<"$output"; then
+        break
+      fi
+    fi
+    (( waited < timeout )) || break
     sleep 2
+    waited=$((waited+2))
+    address=
   done
   unset password
   [[ -z "$output" ]] || printf '%s\n' "$output"
   [[ "$status" == 0 ]] || die "Umbrel SSH command '$path $*' failed with exit $status"
   GUEST_EXEC_STDOUT="$output"
 }
+startos_exec_sync() {
+  local path="$1" timeout="$2"; shift 2
+  if virshq qemu-agent-command "$(domain startos)" '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+    guest_exec_sync startos "$path" "$timeout" "$@"
+    return
+  fi
+  [[ "$STARTOS_SSH_PRIVATE_KEY" == /* && -f "$STARTOS_SSH_PRIVATE_KEY" ]] ||
+    die "StartOS QGA is unavailable and STARTOS_SSH_PRIVATE_KEY is not configured"
+  local address="${STARTOS_MANAGEMENT_ADDRESS:-}" output status remote_command arg
+  local waited=0 attempt_timeout
+  printf -v remote_command 'sudo -- %q' "$path"
+  for arg in "$@"; do printf -v remote_command '%s %q' "$remote_command" "$arg"; done
+  while :; do
+    if virshq qemu-agent-command "$(domain startos)" \
+      '{"execute":"guest-ping"}' >/dev/null 2>&1; then
+      guest_exec_sync startos "$path" "$timeout" "$@"
+      return
+    fi
+    [[ -n "$address" ]] || address="$(domain_ipv4 startos)"
+    if [[ ! "$address" =~ ^[A-Za-z0-9:.%-]+$ ]]; then
+      status=255
+      output="StartOS management address is not available"
+    else
+      attempt_timeout=10
+      (( timeout - waited < attempt_timeout )) && attempt_timeout=$((timeout-waited))
+      (( attempt_timeout > 0 )) || break
+      set +e
+      output="$(timeout "$attempt_timeout" ssh -i "$STARTOS_SSH_PRIVATE_KEY" \
+        -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+        "$STARTOS_SSH_USER@$address" "$remote_command" 2>&1)"
+      status=$?
+      set -e
+      (( status == 0 )) && break
+      if (( status != 255 && status != 124 )) ||
+        ! grep -Eqi 'connection refused|no route to host|connection timed out|operation timed out|network is unreachable' <<<"$output"; then
+        break
+      fi
+    fi
+    (( waited < timeout )) || break
+    sleep 2
+    waited=$((waited+2))
+    address=
+  done
+  [[ -z "$output" ]] || printf '%s\n' "$output"
+  [[ "$status" == 0 ]] ||
+    die "StartOS SSH command '$path $*' failed with exit $status"
+  GUEST_EXEC_STDOUT="$output"
+}
 platform_exec_sync() {
   local vm="$1" path="$2" timeout="$3"; shift 3
   if [[ "$vm" == umbrel ]]; then umbrel_exec_sync "$path" "$timeout" "$@"
+  elif [[ "$vm" == startos ]]; then startos_exec_sync "$path" "$timeout" "$@"
   else guest_exec_sync "$vm" "$path" "$timeout" "$@"
   fi
 }
@@ -150,12 +303,12 @@ meta_get() {
   [[ -f "$file" ]] && sed -n "s/^${key}=//p" "$file" | head -1
   return 0
 }
-overlay_vm() { meta_get "$OVERLAY_META" vm; }
-owner_vm() { meta_get "$OWNER_FILE" vm; }
-owner_kind() { meta_get "$OWNER_FILE" kind; }
-owner_image() { meta_get "$OWNER_FILE" image; }
+overlay_vm() { meta_get "${1:-$OVERLAY_META}" vm; }
+owner_vm() { meta_get "${1:-$OWNER_FILE}" vm; }
+owner_kind() { meta_get "${1:-$OWNER_FILE}" kind; }
+owner_image() { meta_get "${1:-$OWNER_FILE}" image; }
 canonical_id() { meta_get "$CANONICAL_META" id; }
-overlay_id() { meta_get "$OVERLAY_META" overlay_id; }
+overlay_id() { meta_get "${1:-$OVERLAY_META}" overlay_id; }
 checkpoint_generation() { meta_get "$CANONICAL_META" generation; }
 profile_generation_digest() {
   printf '%s\n' \
@@ -170,6 +323,31 @@ profile_generation_id() {
 active_profile_generation_digest() {
   printf '%s' "${PROFILE_GENERATION_DIGEST:-$(profile_generation_digest)}"
 }
+assert_overlay_chain() {
+  [[ -f "$OVERLAY" && -f "$OVERLAY_META" ]] || die "active overlay or manifest is missing"
+  local expected_backing
+  expected_backing="$(backing_image_for_vm "$LIFECYCLE_VM")"
+  [[ "$(meta_get "$OVERLAY_META" backing)" == "$expected_backing" ]] ||
+    die "overlay manifest backing path is invalid"
+  [[ "$(meta_get "$OVERLAY_META" canonical_id)" == "$(canonical_id)" ]] ||
+    die "overlay survived a checkpoint replacement; discard it"
+  [[ "$(meta_get "$OVERLAY_META" checkpoint_generation)" == "$(checkpoint_generation)" ]] ||
+    die "overlay checkpoint generation does not match the canonical checkpoint"
+  [[ -n "$(overlay_id)" ]] || die "overlay manifest lacks a unique overlay ID"
+  local backing
+  if [[ -r "$OVERLAY" ]]; then
+    backing="$(qemu-img info --force-share --output=json "$OVERLAY" | jq -er '.["backing-filename"]')"
+  else
+    backing="$(sudo -n qemu-img info --force-share --output=json "$OVERLAY" |
+      jq -er '.["backing-filename"]')"
+  fi
+  [[ "$backing" == "$expected_backing" ]] ||
+    die "overlay qcow2 backing is '$backing', expected '$expected_backing'"
+  if [[ "$LIFECYCLE_VM" == startos ]]; then
+    [[ "$(meta_get "$OVERLAY_META" startos_adapter_id)" == "$(meta_get "$STARTOS_LAYER_META" id)" ]] ||
+      die "StartOS overlay belongs to another filesystem-adapter generation"
+  fi
+}
 new_id() {
   if command -v uuidgen >/dev/null; then uuidgen
   else printf '%s-%s-%s\n' "$(date +%s%N)" "$$" "$RANDOM" | sha256sum | cut -d' ' -f1
@@ -178,7 +356,7 @@ new_id() {
 
 validate_host_config_values() {
   local name value
-  for name in BVML_STORAGE BVML_MEDIA_DIR BVML_HOST_CONFIG_DIR CHECKPOINT_PROFILE_FILE CHECKPOINT_PROFILE_SOURCE UMBREL_PROFILE; do
+  for name in BVML_STORAGE BVML_MEDIA_DIR BVML_HOST_CONFIG_DIR CHECKPOINT_PROFILE_FILE CHECKPOINT_PROFILE_SOURCE UMBREL_PROFILE STARTOS_PROFILE INDEX_PROFILE STARTOS_ISO STARTOS_PACKAGE STARTOS_CLI; do
     value="${!name:-}"
     [[ "$value" == /* && ! "$value" =~ [[:cntrl:]] && "$value" != *'"'* ]] ||
       die "$name must be an absolute path without quotes or control characters"
@@ -189,30 +367,171 @@ validate_host_config_values() {
       die "$name must be empty or an absolute path without control characters"
   done
   [[ "$SHUTDOWN_TIMEOUT" =~ ^[1-9][0-9]*$ && "$GUEST_EXEC_TIMEOUT" =~ ^[1-9][0-9]*$ &&
-     "$MAX_TIP_AGE_SECONDS" =~ ^[1-9][0-9]*$ ]] ||
+     "$MAX_TIP_AGE_SECONDS" =~ ^[1-9][0-9]*$ &&
+     "$STARTOS_OPERATION_TIMEOUT" =~ ^[1-9][0-9]*$ &&
+     "$STARTOS_BTRFS_CONVERT_TIMEOUT" =~ ^[1-9][0-9]*$ &&
+     "$STARTOS_BTRFS_ADAPTER_MAX_GIB" =~ ^[1-9][0-9]*$ &&
+     "$STARTOS_BTRFS_ADAPTER_MAX_PERCENT" =~ ^[1-9][0-9]*$ &&
+     "$ELECTRS_BASE_SIZE_GIB" =~ ^[1-9][0-9]*$ &&
+     "$FULCRUM_BASE_SIZE_GIB" =~ ^[1-9][0-9]*$ &&
+     "$INDEX_BUILD_TIMEOUT" =~ ^[1-9][0-9]*$ ]] ||
     die "timeout and chain-tip-age settings must be positive integers"
 }
 validate_host_config_values
 
 init_layout() {
+  local vm
   if [[ "${BVML_TESTING:-0}" == 1 ]]; then
-    install -d -m 0750 "$BVML_STORAGE" "$CANONICAL_DIR" "$ACTIVE_DIR" "$RUN_DIR" "$ADAPTER_STATE_DIR" "$BVML_STORAGE/vms"
+    install -d -m 0750 "$BVML_STORAGE" "$CANONICAL_DIR" "$ACTIVE_DIR" "$RUN_DIR" \
+      "$LIFECYCLE_ROOT" "$ADAPTER_STATE_DIR" "$STARTOS_LAYER_DIR" "$INDEX_ROOT" \
+      "$INDEX_RUN_ROOT" "$BVML_STORAGE/vms"
   else
     need sudo
     sudo install -d -o "$USER" -g "$QEMU_GROUP" -m 0750 \
-      "$BVML_STORAGE" "$CANONICAL_DIR" "$ACTIVE_DIR" "$RUN_DIR" "$ADAPTER_STATE_DIR" "$BVML_STORAGE/vms"
+      "$BVML_STORAGE" "$CANONICAL_DIR" "$ACTIVE_DIR" "$RUN_DIR" \
+      "$LIFECYCLE_ROOT" "$ADAPTER_STATE_DIR" "$STARTOS_LAYER_DIR" "$INDEX_ROOT" \
+      "$INDEX_RUN_ROOT" "$BVML_STORAGE/vms"
   fi
-  touch "$LOCK_FILE"; chmod 0640 "$LOCK_FILE"
+  touch "$GLOBAL_LOCK_FILE"; chmod 0640 "$GLOBAL_LOCK_FILE"
+  touch "$STARTOS_LAYER_LOCK"; chmod 0640 "$STARTOS_LAYER_LOCK"
+  for vm in ubuntu umbrel startos; do
+    if [[ "${BVML_TESTING:-0}" == 1 ]]; then
+      install -d -m 0750 "$(lifecycle_dir "$vm")" "$(lifecycle_active_dir "$vm")"
+    else
+      sudo install -d -o "$USER" -g "$QEMU_GROUP" -m 0750 \
+        "$(lifecycle_dir "$vm")" "$(lifecycle_active_dir "$vm")"
+    fi
+    touch "$(lifecycle_lock "$vm")"; chmod 0640 "$(lifecycle_lock "$vm")"
+    local service
+    while read -r service; do
+      if [[ "${BVML_TESTING:-0}" == 1 ]]; then
+        install -d -m 0750 "$(index_service_dir "$vm" "$service")"
+      else
+        sudo install -d -o "$USER" -g "$QEMU_GROUP" -m 0750 \
+          "$(index_service_dir "$vm" "$service")"
+      fi
+    done < <(index_services_for_vm "$vm")
+  done
+  local service
+  for service in electrs fulcrum; do
+    if [[ "${BVML_TESTING:-0}" == 1 ]]; then
+      install -d -m 0750 "$(index_base_dir "$service")"
+    else
+      sudo install -d -o "$USER" -g "$QEMU_GROUP" -m 0750 "$(index_base_dir "$service")"
+    fi
+  done
   if [[ "${BVML_TESTING:-0}" != 1 ]] && command -v setfacl >/dev/null; then
     setfacl -m "u:$QEMU_USER:--x" "$BVML_STORAGE" "$CANONICAL_DIR" "$ACTIVE_DIR" "$BVML_STORAGE/vms"
+    for vm in ubuntu umbrel startos; do
+      setfacl -m "u:$QEMU_USER:--x" "$(lifecycle_active_dir "$vm")"
+    done
+    setfacl -m "u:$QEMU_USER:--x" "$INDEX_ROOT"
+    for service in electrs fulcrum; do
+      setfacl -m "u:$QEMU_USER:--x" "$(index_base_dir "$service")"
+    done
   fi
 }
 
-with_lock() {
+with_global_lock() {
   init_layout
-  exec 9>"$LOCK_FILE"
-  flock -n 9 || die "another bitcoin-vm-lab storage operation is running"
+  exec 9>"$GLOBAL_LOCK_FILE"
+  flock -n 9 || die "another canonical bitcoin-vm-lab operation is running"
+  migrate_legacy_lifecycle_state
   "$@"
+}
+
+with_vm_lock() {
+  local vm="$1"; shift
+  valid_vm "$vm"; init_layout
+  exec 9>"$GLOBAL_LOCK_FILE"
+  flock -n 9 || die "another canonical bitcoin-vm-lab operation is running"
+  migrate_legacy_lifecycle_state
+  flock -u 9
+  exec 8>"$(lifecycle_lock "$vm")"
+  flock -n 8 || die "another $vm lifecycle operation is running"
+  set_lifecycle_context "$vm"
+  "$@"
+}
+
+with_all_vm_locks() {
+  init_layout
+  exec 9>"$GLOBAL_LOCK_FILE"
+  flock -n 9 || die "canonical state is being changed; retry validation"
+  migrate_legacy_lifecycle_state
+  flock -u 9
+  exec 6>"$(lifecycle_lock ubuntu)"
+  exec 7>"$(lifecycle_lock umbrel)"
+  exec 8>"$(lifecycle_lock startos)"
+  flock -n 6 || die "Ubuntu lifecycle is changing; retry validation"
+  flock -n 7 || die "Umbrel lifecycle is changing; retry validation"
+  flock -n 8 || die "StartOS lifecycle is changing; retry validation"
+  "$@"
+}
+
+with_lock() { with_global_lock "$@"; }
+
+legacy_lifecycle_paths() {
+  for path in "$LEGACY_OVERLAY" "$LEGACY_OVERLAY_META" "$LEGACY_VERIFY_META" \
+    "$LEGACY_OWNER_FILE" "$LEGACY_ADAPTER_RECOVERY_META"; do
+    [[ -e "$path" ]] && printf '%s\n' "$path"
+  done
+  return 0
+}
+
+migrate_legacy_lifecycle_state() {
+  local found vm manifest_vm owner_vm_value recovery_vm
+  found="$(legacy_lifecycle_paths)"
+  [[ -n "$found" ]] || return 0
+  manifest_vm="$(meta_get "$LEGACY_OVERLAY_META" vm)"
+  owner_vm_value="$(meta_get "$LEGACY_OWNER_FILE" vm)"
+  recovery_vm="$(meta_get "$LEGACY_ADAPTER_RECOVERY_META" vm)"
+  vm="${manifest_vm:-${owner_vm_value:-$recovery_vm}}"
+  valid_vm "$vm"
+  [[ -z "$manifest_vm" || "$manifest_vm" == "$vm" ]] ||
+    die "legacy overlay manifest and owner identify different VMs"
+  [[ -z "$owner_vm_value" || "$owner_vm_value" == "$vm" ]] ||
+    die "legacy owner and overlay manifest identify different VMs"
+  [[ -z "$recovery_vm" || "$recovery_vm" == "$vm" ]] ||
+    die "legacy recovery metadata identifies another VM"
+  local target
+  for target in "$(lifecycle_overlay "$vm")" "$(lifecycle_meta "$vm")" \
+    "$(lifecycle_verify "$vm")" "$(lifecycle_owner "$vm")" "$(lifecycle_recovery "$vm")"; do
+    [[ ! -e "$target" ]] || die "cannot migrate legacy lifecycle: target already exists: $target"
+  done
+  [[ ! -e "$LEGACY_OVERLAY" || -e "$LEGACY_OVERLAY_META" ]] ||
+    die "cannot migrate legacy overlay without its manifest"
+  [[ ! -e "$LEGACY_OVERLAY_META" || -e "$LEGACY_OVERLAY" ]] ||
+    die "cannot migrate legacy manifest without its overlay"
+  [[ ! -e "$LEGACY_OWNER_FILE" || -e "$LEGACY_OVERLAY_META" ]] ||
+    die "cannot migrate legacy owner without an overlay manifest"
+  [[ ! -e "$LEGACY_VERIFY_META" || "$vm" == ubuntu ]] ||
+    die "legacy producer evidence is attached to non-Ubuntu lifecycle state"
+  if [[ -e "$LEGACY_OVERLAY" ]]; then
+    [[ -z "$(attached_vm_for_path "$LEGACY_OVERLAY")" ]] ||
+      die "legacy overlay is still attached; stop and detach it before automatic layout migration"
+    if is_defined "$vm"; then
+      is_shut_off "$vm" ||
+        die "legacy $vm lifecycle is active; exact 'shut off' is required for layout migration"
+    fi
+    assert_no_process_reference "$LEGACY_OVERLAY"
+  fi
+  [[ ! -e "$LEGACY_OVERLAY" ]] ||
+    mv -- "$LEGACY_OVERLAY" "$(lifecycle_overlay "$vm")"
+  [[ ! -e "$LEGACY_OVERLAY_META" ]] ||
+    mv -- "$LEGACY_OVERLAY_META" "$(lifecycle_meta "$vm")"
+  [[ ! -e "$LEGACY_VERIFY_META" ]] ||
+    mv -- "$LEGACY_VERIFY_META" "$(lifecycle_verify "$vm")"
+  [[ ! -e "$LEGACY_OWNER_FILE" ]] ||
+    mv -- "$LEGACY_OWNER_FILE" "$(lifecycle_owner "$vm")"
+  [[ ! -e "$LEGACY_ADAPTER_RECOVERY_META" ]] ||
+    mv -- "$LEGACY_ADAPTER_RECOVERY_META" "$(lifecycle_recovery "$vm")"
+  if [[ -f "$(lifecycle_owner "$vm")" ]]; then
+    sed -i \
+      -e "s#^image=$LEGACY_OVERLAY\$#image=$(lifecycle_overlay "$vm")#" \
+      -e "s#^overlay=$LEGACY_OVERLAY\$#overlay=$(lifecycle_overlay "$vm")#" \
+      "$(lifecycle_owner "$vm")"
+  fi
+  note "migrated legacy singleton lifecycle state to $vm"
 }
 
 write_env_file() {
@@ -225,6 +544,18 @@ write_env_file() {
   umask 077
   : >"$path"
   for item in "$@"; do printf '%s\n' "$item" >>"$path"; done
+}
+
+meta_set() {
+  local path="$1" key="$2" value="$3" tmp
+  [[ -f "$path" ]] || die "cannot update missing manifest: $path"
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && ! "$value" =~ [[:cntrl:]] ]] ||
+    die "refusing malformed manifest update for $path"
+  tmp="${path}.new.$$"
+  awk -F= -v key="$key" '$1 != key' "$path" >"$tmp"
+  printf '%s=%s\n' "$key" "$value" >>"$tmp"
+  chmod --reference="$path" "$tmp"
+  mv -- "$tmp" "$path"
 }
 
 all_shut_off() {
@@ -247,6 +578,12 @@ disk_target_sources() {
     awk 'NR>2 && $4 != "-" {print $3 "\t" $4}'
 }
 
+target_for_source() {
+  local vm="$1" source="$2"
+  virshq domblklist "$(domain "$vm")" --details 2>/dev/null |
+    awk -v wanted="$source" 'NR>2 && $4 == wanted {print $3; exit}'
+}
+
 attached_vm_for_path() {
   local wanted="$1" vm src
   for vm in ubuntu umbrel startos; do
@@ -256,11 +593,29 @@ attached_vm_for_path() {
 }
 
 attachment_serial_for_path() {
-  local vm="$1" image="$2"
+  local vm="$1" image="$2" candidate
   if [[ "${BVML_TESTING:-0}" == 1 ]]; then
-    if [[ "$image" == "$OVERLAY" ]]; then meta_get "$OVERLAY_META" disk_serial
-    elif [[ "$image" == "$BOOTSTRAP" ]]; then meta_get "$BOOTSTRAP_META" disk_serial
-    fi
+    for candidate in ubuntu umbrel startos; do
+      if [[ "$image" == "$(lifecycle_overlay "$candidate")" ]]; then
+        meta_get "$(lifecycle_meta "$candidate")" disk_serial
+        return
+      fi
+    done
+    [[ "$image" != "$BOOTSTRAP" ]] || meta_get "$BOOTSTRAP_META" disk_serial
+    local service meta
+    for service in electrs fulcrum; do
+      if [[ "$image" == "$(index_bootstrap "$service")" ]]; then
+        meta_get "$(index_bootstrap_meta "$service")" disk_serial
+        return
+      fi
+      for candidate in ubuntu umbrel startos; do
+        if [[ "$image" == "$(index_overlay "$candidate" "$service")" ]]; then
+          meta="$(index_overlay_meta "$candidate" "$service")"
+          meta_get "$meta" disk_serial
+          return
+        fi
+      done
+    done
     return
   fi
   command -v xmllint >/dev/null || return 1
@@ -278,13 +633,98 @@ all_attached_pairs() {
         printf '%s\t%s\n' "$vm" "$src"
       else
         case "$src" in
-          "$OVERLAY"|"$BOOTSTRAP"|"$CANONICAL"|"$ROLLBACK"|"$IMPORT_CANDIDATE"|"$BOOTSTRAP_CANDIDATE")
+          "$OVERLAY"|"$BOOTSTRAP"|"$CANONICAL"|"$ROLLBACK"|"$IMPORT_CANDIDATE"|"$BOOTSTRAP_CANDIDATE"|"$STARTOS_LAYER"|"$STARTOS_LAYER_CANDIDATE")
           printf '%s\t%s\n' "$vm" "$src"
           ;;
         esac
       fi
     done < <(disk_target_sources "$vm")
   done
+}
+
+all_index_attached_pairs() {
+  local vm owner_vm service src candidate
+  for vm in ubuntu umbrel startos; do
+    is_defined "$vm" || continue
+    while read -r src; do
+      for service in electrs fulcrum; do
+        for candidate in "$(index_base "$service")" "$(index_bootstrap "$service")"; do
+          [[ "$src" != "$candidate" ]] || printf '%s\t%s\t%s\n' "$vm" "$service" "$src"
+        done
+        for owner_vm in ubuntu umbrel startos; do
+          index_supported_for_vm "$owner_vm" "$service" || continue
+          candidate="$(index_overlay "$owner_vm" "$service")"
+          [[ "$src" != "$candidate" ]] ||
+            printf '%s\t%s\t%s\n' "$vm" "$service" "$src"
+        done
+      done
+    done < <(disk_sources "$vm")
+  done
+}
+
+validate_index_profile() {
+  [[ "$INDEX_PROFILE" == /* && -f "$INDEX_PROFILE" ]] ||
+    die "INDEX_PROFILE must name an absolute existing file"
+  [[ "$INDEX_PROFILE_SHA256" =~ ^[0-9a-fA-F]{64}$ &&
+     "$(sha256sum "$INDEX_PROFILE" | awk '{print $1}')" == "${INDEX_PROFILE_SHA256,,}" ]] ||
+    die "index-service profile digest mismatch"
+  jq -e '
+    .profile_version == 1 and
+    (.profile_id | type == "string" and length > 0) and
+    .filesystems.base == "btrfs" and
+    (.electrs.version | type == "string" and length > 0) and
+    (.fulcrum.version | type == "string" and length > 0) and
+    (.electrs.umbrel.store_commit | test("^[0-9a-f]{40}$")) and
+    (.fulcrum.umbrel.store_commit | test("^[0-9a-f]{40}$")) and
+    (.fulcrum.startos.release_sha256 | test("^[0-9a-f]{64}$"))
+  ' "$INDEX_PROFILE" >/dev/null || die "index-service profile schema is invalid"
+}
+
+index_base_preflight() {
+  local service="$1" image meta info
+  valid_index_service "$service"; validate_index_profile
+  image="$(index_base "$service")"; meta="$(index_base_meta "$service")"
+  [[ -f "$image" && -f "$meta" ]] || die "$service protected index base is absent"
+  for field in id bitcoin_canonical_id bitcoin_checkpoint_generation filesystem_uuid \
+    profile_id profile_sha256 tip_hash tip_height database_layout; do
+    [[ -n "$(meta_get "$meta" "$field")" ]] ||
+      die "$service base manifest lacks $field"
+  done
+  [[ "$(meta_get "$meta" bitcoin_canonical_id)" == "$(canonical_id)" &&
+     "$(meta_get "$meta" bitcoin_checkpoint_generation)" == "$(checkpoint_generation)" ]] ||
+    die "$service base belongs to another Bitcoin canonical generation"
+  [[ "$(meta_get "$meta" profile_sha256)" == "${INDEX_PROFILE_SHA256,,}" ]] ||
+    die "$service base used another index-service profile"
+  info="$(qemu-img info --force-share --output=json "$image")"
+  [[ "$(jq -r .format <<<"$info")" == qcow2 &&
+     -z "$(jq -r '.["backing-filename"] // empty' <<<"$info")" ]] ||
+    die "$service base must be a standalone qcow2"
+  qemu-img check "$image" >/dev/null || die "$service base qemu-img check failed"
+  [[ "$(stat -c %a "$image")" == 440 ]] || die "$service base mode must be 0440"
+  image_immutable "$image" || die "$service base immutable protection is missing"
+  qemu_can_read_image "$image" || die "system QEMU cannot read the $service base"
+  [[ -z "$(attached_vm_for_path "$image")" ]] ||
+    die "$service base is attached directly to a VM"
+}
+
+index_overlay_preflight() {
+  local vm="$1" service="$2" image meta base backing
+  index_supported_for_vm "$vm" "$service" ||
+    die "$service is unsupported on $vm"
+  image="$(index_overlay "$vm" "$service")"
+  meta="$(index_overlay_meta "$vm" "$service")"
+  base="$(index_base "$service")"
+  [[ -f "$image" && -f "$meta" ]] || die "$vm $service overlay state is incomplete"
+  [[ "$(meta_get "$meta" vm)" == "$vm" &&
+     "$(meta_get "$meta" service)" == "$service" &&
+     "$(meta_get "$meta" bitcoin_canonical_id)" == "$(canonical_id)" &&
+     "$(meta_get "$meta" bitcoin_checkpoint_generation)" == "$(checkpoint_generation)" ]] ||
+    die "$vm $service overlay manifest does not match its protected bases"
+  backing="$(qemu-img info --force-share --output=json "$image" |
+    jq -er '.["backing-filename"]')"
+  [[ "$backing" == "$base" ]] ||
+    die "$vm $service overlay backing path is '$backing', expected '$base'"
+  qemu-img check "$image" >/dev/null || die "$vm $service overlay qemu-img check failed"
 }
 
 bitcoin_attachment_count() {
@@ -297,9 +737,90 @@ assert_no_bitcoin_attachments() {
 }
 
 assert_no_extra_overlays() {
-  local extra
-  extra="$(find "$ACTIVE_DIR" -maxdepth 1 -type f -name '*.qcow2' ! -path "$OVERLAY" ! -path "$BOOTSTRAP" -print -quit 2>/dev/null)"
+  local extra="" path allowed vm service
+  while IFS= read -r path; do
+    allowed=0
+    [[ "$path" == "$BOOTSTRAP" ]] && allowed=1
+    for vm in ubuntu umbrel startos; do
+      [[ "$path" == "$(lifecycle_overlay "$vm")" ]] && allowed=1
+      for service in electrs fulcrum; do
+        index_supported_for_vm "$vm" "$service" || continue
+        [[ "$path" == "$(index_overlay "$vm" "$service")" ]] && allowed=1
+      done
+    done
+    (( allowed == 1 )) || { extra="$path"; break; }
+  done < <(find "$ACTIVE_DIR" -type f -name '*.qcow2' 2>/dev/null)
   [[ -z "$extra" ]] || die "unexpected extra overlay exists: $extra"
+}
+
+dependent_overlay_count() {
+  local vm service count=0
+  for vm in ubuntu umbrel startos; do
+    [[ -e "$(lifecycle_overlay "$vm")" || -e "$(lifecycle_meta "$vm")" ]] && ((count+=1))
+  done
+  if [[ -e "$STARTOS_LAYER" || -e "$STARTOS_LAYER_META" ||
+        -e "$STARTOS_LAYER_CANDIDATE" || -e "$STARTOS_LAYER_CANDIDATE_META" ||
+        -e "$STARTOS_LAYER_RECOVERY" ]]; then
+    ((count+=1))
+  fi
+  for service in electrs fulcrum; do
+    [[ -e "$(index_base "$service")" || -e "$(index_base_meta "$service")" ||
+       -e "$(index_bootstrap "$service")" || -e "$(index_bootstrap_meta "$service")" ]] &&
+      ((count+=1))
+    for vm in ubuntu umbrel startos; do
+      index_supported_for_vm "$vm" "$service" || continue
+      [[ -e "$(index_overlay "$vm" "$service")" ||
+         -e "$(index_overlay_meta "$vm" "$service")" ]] && ((count+=1))
+    done
+  done
+  printf '%s\n' "$count"
+}
+
+assert_no_dependent_overlays() {
+  local count; count="$(dependent_overlay_count)"
+  [[ "$count" == 0 ]] || die "canonical mutation is blocked by $count dependent overlay lifecycle(s)"
+}
+
+assert_only_dependent_overlay() {
+  local allowed="$1" vm
+  [[ ! -e "$STARTOS_LAYER" && ! -e "$STARTOS_LAYER_META" &&
+     ! -e "$STARTOS_LAYER_CANDIDATE" && ! -e "$STARTOS_LAYER_CANDIDATE_META" &&
+     ! -e "$STARTOS_LAYER_RECOVERY" ]] ||
+    die "canonical mutation is blocked by the StartOS filesystem adapter"
+  for vm in ubuntu umbrel startos; do
+    [[ "$vm" == "$allowed" ]] && continue
+    [[ ! -e "$(lifecycle_overlay "$vm")" && ! -e "$(lifecycle_meta "$vm")" ]] ||
+      die "canonical mutation is blocked by the $vm dependent overlay"
+  done
+}
+
+startos_adapter_preflight() {
+  [[ -f "$STARTOS_LAYER" && -f "$STARTOS_LAYER_META" ]] ||
+    die "StartOS Btrfs adapter is not ready; run startos-adapter-build"
+  [[ "$(meta_get "$STARTOS_LAYER_META" state)" == ready &&
+     "$(meta_get "$STARTOS_LAYER_META" filesystem)" == btrfs &&
+     "$(meta_get "$STARTOS_LAYER_META" rollback_subvolume_removed)" == 1 ]] ||
+    die "StartOS Btrfs adapter manifest is incomplete"
+  [[ "$(meta_get "$STARTOS_LAYER_META" canonical_id)" == "$(canonical_id)" &&
+     "$(meta_get "$STARTOS_LAYER_META" checkpoint_generation)" == "$(checkpoint_generation)" ]] ||
+    die "StartOS Btrfs adapter belongs to another canonical generation"
+  [[ -n "$(meta_get "$STARTOS_LAYER_META" id)" ]] ||
+    die "StartOS Btrfs adapter lacks a generation ID"
+  local info
+  info="$(qemu-img info --output=json "$STARTOS_LAYER")"
+  [[ "$(jq -r .format <<<"$info")" == qcow2 &&
+     "$(jq -r '.["backing-filename"] // empty' <<<"$info")" == "$CANONICAL" ]] ||
+    die "StartOS Btrfs adapter backing chain is invalid"
+  qemu-img check "$STARTOS_LAYER" >/dev/null ||
+    die "StartOS Btrfs adapter qemu-img check failed"
+  [[ "$(stat -c %a "$STARTOS_LAYER")" == 440 ]] ||
+    die "StartOS Btrfs adapter mode must be 0440"
+  image_immutable "$STARTOS_LAYER" ||
+    die "StartOS Btrfs adapter immutable protection is missing"
+  qemu_can_read_image "$STARTOS_LAYER" ||
+    die "system QEMU cannot read the StartOS Btrfs adapter"
+  [[ -z "$(attached_vm_for_path "$STARTOS_LAYER")" ]] ||
+    die "StartOS Btrfs adapter is attached directly to a VM"
 }
 
 image_immutable() {
@@ -477,19 +998,23 @@ canonical_preflight() {
   [[ "$(stat -c %a "$CANONICAL")" == 440 ]] || die "canonical mode must be 0440"
   image_immutable "$CANONICAL" || die "canonical immutable protection is missing"
   qemu_can_read_image "$CANONICAL" || die "system QEMU cannot traverse/read the canonical image"
-  assert_no_process_reference "$CANONICAL"
   [[ -z "$(attached_vm_for_path "$CANONICAL")" ]] || die "canonical checkpoint is attached directly to a VM"
 }
 
 assert_initialization_state_empty() {
-  local requested="$1" path
+  local requested="$1" path vm
   all_shut_off
   assert_no_bitcoin_attachments
   for path in "$CANONICAL" "$CANONICAL_META" "$BOOTSTRAP" "$BOOTSTRAP_META" \
     "$BOOTSTRAP_VERIFY" "$BOOTSTRAP_CANDIDATE" "$BOOTSTRAP_CANDIDATE_META" \
-    "$IMPORT_CANDIDATE" "$IMPORT_META" "$OVERLAY" "$OVERLAY_META" "$VERIFY_META" \
-    "$OWNER_FILE" "$RECOVERY_META"; do
+    "$IMPORT_CANDIDATE" "$IMPORT_META" "$RECOVERY_META"; do
     [[ ! -e "$path" ]] || die "$requested cannot begin while lifecycle state exists: $path"
+  done
+  for vm in ubuntu umbrel startos; do
+    for path in "$(lifecycle_overlay "$vm")" "$(lifecycle_meta "$vm")" \
+      "$(lifecycle_verify "$vm")" "$(lifecycle_owner "$vm")" "$(lifecycle_recovery "$vm")"; do
+      [[ ! -e "$path" ]] || die "$requested cannot begin while lifecycle state exists: $path"
+    done
   done
 }
 
@@ -505,17 +1030,24 @@ assert_provisioning_safe() {
 }
 
 assert_no_bitcoin_lifecycle() {
-  [[ ! -e "$OWNER_FILE" ]] || die "provisioning is blocked while lifecycle ownership exists"
+  local vm
+  for vm in ubuntu umbrel startos; do
+    [[ ! -e "$(lifecycle_owner "$vm")" ]] ||
+      die "provisioning is blocked while lifecycle ownership exists for $vm"
+  done
   [[ "$(bitcoin_attachment_count)" == 0 ]] ||
     die "provisioning is blocked while a Bitcoin data image is attached"
 }
 
 lifecycle_invariant_errors() {
-  local count owner kind image attached manifest_id owner_id manifest_vm manifest_serial vm state src
+  local owner kind image attached manifest_id owner_id manifest_vm manifest_serial
+  local vm state src meta owner_file verify recovery overlay id other attachments
+  local legacy service index_image index_meta index_attached index_owner_state
+  legacy="$(legacy_lifecycle_paths)"
+  [[ -z "$legacy" ]] ||
+    echo "legacy singleton state awaits automatic per-VM migration"
   if { [[ -e "$CANONICAL" ]] && [[ ! -e "$CANONICAL_META" ]]; } ||
      { [[ ! -e "$CANONICAL" ]] && [[ -e "$CANONICAL_META" ]]; }; then echo "partial canonical image/manifest state"; fi
-  if { [[ -e "$OVERLAY" ]] && [[ ! -e "$OVERLAY_META" ]]; } ||
-     { [[ ! -e "$OVERLAY" ]] && [[ -e "$OVERLAY_META" ]]; }; then echo "partial ordinary overlay image/manifest state"; fi
   if { [[ -e "$BOOTSTRAP" ]] && [[ ! -e "$BOOTSTRAP_META" ]]; } ||
      { [[ ! -e "$BOOTSTRAP" ]] && [[ -e "$BOOTSTRAP_META" ]]; }; then echo "partial bootstrap image/manifest state"; fi
   if { [[ -e "$IMPORT_CANDIDATE" ]] && [[ ! -e "$IMPORT_META" ]]; } ||
@@ -525,80 +1057,152 @@ lifecycle_invariant_errors() {
     echo "partial bootstrap promotion candidate/manifest state"
   fi
   [[ ! -f "$CANONICAL" || ! -f "$BOOTSTRAP" ]] || echo "canonical checkpoint and bootstrap coexist"
-  [[ ! -f "$OVERLAY" || ! -f "$BOOTSTRAP" ]] || echo "bootstrap and ordinary overlay coexist"
   [[ ! -f "$IMPORT_CANDIDATE" || ! -f "$BOOTSTRAP" ]] || echo "import candidate and bootstrap coexist"
   [[ ! -f "$RECOVERY_META" ]] || echo "recovery metadata requires explicit review"
-  count="$(bitcoin_attachment_count)"
-  [[ "$count" -le 1 ]] || echo "more than one Bitcoin storage attachment exists"
   [[ -z "$(attached_vm_for_path "$CANONICAL")" ]] || echo "canonical checkpoint is attached directly"
   [[ -z "$(attached_vm_for_path "$ROLLBACK")" ]] || echo "rollback checkpoint is attached directly"
-  owner="$(owner_vm)"; kind="$(owner_kind)"; image="$(owner_image)"
-  if [[ -n "$owner" ]]; then
-    owner_id="$(meta_get "$OWNER_FILE" identity)"
-    manifest_serial=
-    case "$kind" in
-      overlay)
-        manifest_vm="$(overlay_vm)"; manifest_id="$(overlay_id)"
-        manifest_serial="$(meta_get "$OVERLAY_META" disk_serial)"
-        [[ "$image" == "$OVERLAY" && -f "$OVERLAY" && -f "$OVERLAY_META" ]] ||
-          echo "overlay owner path or manifest disagrees"
-        ;;
-      bootstrap)
-        manifest_vm="$(meta_get "$BOOTSTRAP_META" vm)"
-        manifest_id="$(meta_get "$BOOTSTRAP_META" bootstrap_id)"
-        manifest_serial="$(meta_get "$BOOTSTRAP_META" disk_serial)"
-        [[ "$image" == "$BOOTSTRAP" && -f "$BOOTSTRAP" && -f "$BOOTSTRAP_META" ]] ||
-          echo "bootstrap owner path or manifest disagrees"
-        ;;
-      *) echo "owner kind is missing or unsupported"; manifest_vm= manifest_id= ;;
-    esac
-    [[ "$manifest_vm" == "$owner" && -n "$owner_id" && "$manifest_id" == "$owner_id" ]] ||
-      echo "owner metadata disagrees with image manifest"
-    [[ -n "$manifest_serial" && "$manifest_serial" == "$(meta_get "$OWNER_FILE" disk_serial)" ]] ||
-      echo "owner disk serial disagrees with image manifest"
-    attached="$(attached_vm_for_path "$image" | paste -sd, -)"
-    [[ "$attached" == "$owner" ]] || echo "owner says $owner but image attachment is '${attached:-none}'"
-    if [[ "$attached" == "$owner" ]]; then
-      [[ -n "$(meta_get "$OWNER_FILE" disk_serial)" &&
-         "$(attachment_serial_for_path "$owner" "$image")" == "$(meta_get "$OWNER_FILE" disk_serial)" ]] ||
-        echo "owner disk serial disagrees with libvirt domain XML"
-    fi
-  elif [[ "$count" != 0 ]]; then
-    echo "Bitcoin storage is attached without owner metadata"
-  fi
-  while IFS=$'\t' read -r vm src; do
-    [[ -n "$vm" ]] || continue
-    [[ "$owner" == "$vm" && "$image" == "$src" ]] ||
-      echo "$vm attachment has no matching owner/image record"
-  done < <(all_attached_pairs)
   for vm in ubuntu umbrel startos; do
+    attached=
+    overlay="$(lifecycle_overlay "$vm")"; meta="$(lifecycle_meta "$vm")"
+    owner_file="$(lifecycle_owner "$vm")"; verify="$(lifecycle_verify "$vm")"
+    recovery="$(lifecycle_recovery "$vm")"
+    if { [[ -e "$overlay" ]] && [[ ! -e "$meta" ]]; } ||
+       { [[ ! -e "$overlay" ]] && [[ -e "$meta" ]]; }; then
+      echo "$vm has partial overlay image/manifest state"
+    fi
+    [[ ! -f "$BOOTSTRAP" || ! -f "$overlay" ]] || echo "bootstrap and $vm overlay coexist"
+    [[ ! -f "$recovery" ]] || echo "$vm recovery metadata requires explicit review"
+    owner="$(owner_vm "$owner_file")"; kind="$(owner_kind "$owner_file")"
+    image="$(owner_image "$owner_file")"
+    if [[ -n "$owner" ]]; then
+      owner_id="$(meta_get "$owner_file" identity)"
+      case "$kind" in
+        overlay)
+          manifest_vm="$(overlay_vm "$meta")"; manifest_id="$(overlay_id "$meta")"
+          manifest_serial="$(meta_get "$meta" disk_serial)"
+          if ! [[ "$owner" == "$vm" && "$image" == "$overlay" &&
+                  -f "$overlay" && -f "$meta" ]]; then
+            echo "$vm overlay owner path or manifest disagrees"
+          fi
+          ;;
+        bootstrap)
+          manifest_vm="$(meta_get "$BOOTSTRAP_META" vm)"
+          manifest_id="$(meta_get "$BOOTSTRAP_META" bootstrap_id)"
+          manifest_serial="$(meta_get "$BOOTSTRAP_META" disk_serial)"
+          if ! [[ "$vm" == ubuntu && "$owner" == ubuntu && "$image" == "$BOOTSTRAP" &&
+                  -f "$BOOTSTRAP" && -f "$BOOTSTRAP_META" ]]; then
+            echo "$vm bootstrap owner path or manifest disagrees"
+          fi
+          ;;
+        *) echo "$vm owner kind is missing or unsupported"; manifest_vm= manifest_id= manifest_serial= ;;
+      esac
+      [[ "$manifest_vm" == "$owner" && -n "$owner_id" && "$manifest_id" == "$owner_id" ]] ||
+        echo "$vm owner metadata disagrees with image manifest"
+      [[ -n "$manifest_serial" && "$manifest_serial" == "$(meta_get "$owner_file" disk_serial)" ]] ||
+        echo "$vm owner serial disagrees with image manifest"
+      attached="$(attached_vm_for_path "$image" | paste -sd, -)"
+      [[ "$attached" == "$vm" ]] ||
+        echo "$vm owner attachment is '${attached:-none}'"
+      [[ "$attached" != "$vm" ||
+         "$(attachment_serial_for_path "$vm" "$image")" == "$(meta_get "$owner_file" disk_serial)" ]] ||
+        echo "$vm owner serial disagrees with domain XML"
+    fi
+    attachments="$(all_attached_pairs | awk -F '\t' -v vm="$vm" '$1 == vm {n++} END {print n+0}')"
+    [[ "$attachments" -le 1 ]] || echo "$vm has more than one Bitcoin storage attachment"
+    while IFS=$'\t' read -r other src; do
+      [[ "$other" != "$vm" ]] || {
+        [[ -n "$owner" && "$owner" == "$vm" && "$image" == "$src" ]] ||
+          echo "$vm attachment has no matching owner/image record"
+      }
+    done < <(all_attached_pairs)
     is_defined "$vm" || continue
     state="$(domain_state "$vm")"
     if [[ "$state" != "shut off" ]]; then
-      [[ "$owner" == "$vm" && -n "$image" ]] ||
+      [[ "$owner" == "$vm" && -n "$image" && "$attached" == "$vm" ]] ||
         echo "$(domain "$vm") is '$state' without matching Bitcoin owner state"
     fi
+    if [[ -f "$verify" ]]; then
+      [[ -f "$overlay" &&
+         "$(meta_get "$verify" overlay_id)" == "$(overlay_id "$meta")" &&
+         "$(meta_get "$verify" checkpoint_generation)" == "$(meta_get "$meta" checkpoint_generation)" ]] ||
+        echo "$vm verification evidence belongs to another image or generation"
+    fi
+    id="$(overlay_id "$meta")"
+    if [[ -n "$id" ]]; then
+      for other in ubuntu umbrel startos; do
+        [[ "$other" == "$vm" || "$(overlay_id "$(lifecycle_meta "$other")")" != "$id" ]] ||
+          echo "$vm and $other have duplicate overlay IDs"
+      done
+    fi
   done
-  if [[ -f "$VERIFY_META" ]]; then
-    [[ -f "$OVERLAY" &&
-       "$(meta_get "$VERIFY_META" overlay_id)" == "$(overlay_id)" &&
-       "$(meta_get "$VERIFY_META" checkpoint_generation)" == "$(meta_get "$OVERLAY_META" checkpoint_generation)" ]] ||
-      echo "ordinary verification evidence belongs to another image or generation"
-  fi
   if [[ -f "$BOOTSTRAP_VERIFY" ]]; then
     [[ -f "$BOOTSTRAP" &&
        "$(meta_get "$BOOTSTRAP_VERIFY" bootstrap_id)" == "$(meta_get "$BOOTSTRAP_META" bootstrap_id)" ]] ||
       echo "bootstrap verification evidence belongs to another image"
   fi
-  for image in "$OVERLAY" "$BOOTSTRAP" "$CANONICAL" "$ROLLBACK"; do
+  for vm in ubuntu umbrel startos; do
+    image="$(lifecycle_overlay "$vm")"
     if process_references_path "$image" && [[ -z "$(attached_vm_for_path "$image")" ]]; then
-      if [[ "$image" == "$CANONICAL" && "$(owner_kind)" == overlay &&
-         -n "$(attached_vm_for_path "$OVERLAY")" ]]; then
-        : # Expected read-only backing-file reference from the attached overlay.
-      else
-        echo "process references $image without libvirt attachment metadata"
-      fi
+      echo "process references $vm overlay without libvirt attachment metadata"
     fi
+  done
+  for image in "$BOOTSTRAP" "$ROLLBACK"; do
+    if process_references_path "$image" && [[ -z "$(attached_vm_for_path "$image")" ]]; then
+      echo "process references $image without libvirt attachment metadata"
+    fi
+  done
+  for service in electrs fulcrum; do
+    index_image="$(index_base "$service")"; index_meta="$(index_base_meta "$service")"
+    if { [[ -e "$index_image" ]] && [[ ! -e "$index_meta" ]]; } ||
+       { [[ ! -e "$index_image" ]] && [[ -e "$index_meta" ]]; }; then
+      echo "$service has partial protected base state"
+    fi
+    [[ -z "$(attached_vm_for_path "$index_image")" ]] ||
+      echo "$service protected base is attached directly"
+    index_image="$(index_bootstrap "$service")"; index_meta="$(index_bootstrap_meta "$service")"
+    if { [[ -e "$index_image" ]] && [[ ! -e "$index_meta" ]]; } ||
+       { [[ ! -e "$index_image" ]] && [[ -e "$index_meta" ]]; }; then
+      echo "$service has partial bootstrap state"
+    fi
+    index_attached="$(attached_vm_for_path "$index_image" | paste -sd, -)"
+    [[ -z "$index_attached" || "$index_attached" == ubuntu ]] ||
+      echo "$service bootstrap is attached outside Ubuntu"
+    if process_references_path "$index_image" && [[ -z "$index_attached" ]]; then
+      echo "process references detached $service bootstrap"
+    fi
+    for vm in ubuntu umbrel startos; do
+      index_supported_for_vm "$vm" "$service" || continue
+      index_image="$(index_overlay "$vm" "$service")"
+      index_meta="$(index_overlay_meta "$vm" "$service")"
+      if { [[ -e "$index_image" ]] && [[ ! -e "$index_meta" ]]; } ||
+         { [[ ! -e "$index_image" ]] && [[ -e "$index_meta" ]]; }; then
+        echo "$vm has partial $service overlay state"
+        continue
+      fi
+      [[ -f "$index_image" && -f "$index_meta" ]] || continue
+      index_attached="$(attached_vm_for_path "$index_image" | paste -sd, -)"
+      index_owner_state="$(meta_get "$index_meta" owner_state)"
+      [[ -z "$index_attached" || "$index_attached" == "$vm" ]] ||
+        echo "$vm $service overlay is attached to $index_attached"
+      if [[ "$index_owner_state" == active ]]; then
+        [[ "$index_attached" == "$vm" ]] ||
+          echo "$vm $service active owner state lacks its attachment"
+      elif [[ "$index_owner_state" == retained ]]; then
+        [[ -z "$index_attached" ]] ||
+          echo "$vm $service retained owner state remains attached"
+      else
+        echo "$vm $service owner state is missing or unsupported"
+      fi
+      if [[ "$index_attached" == "$vm" ]]; then
+        [[ "$(target_for_source "$vm" "$index_image")" == "$(index_target "$service")" ]] ||
+          echo "$vm $service overlay uses the wrong block target"
+        [[ "$(attachment_serial_for_path "$vm" "$index_image")" == "$(meta_get "$index_meta" disk_serial)" ]] ||
+          echo "$vm $service overlay serial disagrees with domain XML"
+      fi
+      if process_references_path "$index_image" && [[ -z "$index_attached" ]]; then
+        echo "process references detached $vm $service overlay"
+      fi
+    done
   done
 }
 
